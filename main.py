@@ -1,8 +1,7 @@
-# AZEUQER TITANIUM 6.2 - LOOT & PROFILE EDITION
-import os, json, time, urllib.parse, random, cv2
-import numpy as np
+# AZEUQER TITANIUM 6.4 - LITE EDITION (NO AI)
+import os, json, time, urllib.parse, random
 from datetime import datetime, timedelta
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Body
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client
@@ -13,8 +12,9 @@ app = FastAPI()
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
+# Fail gracefully if keys are missing
 if not SUPABASE_URL or not SUPABASE_KEY:
-    print("CRITICAL: SUPABASE KEYS MISSING")
+    print("WARNING: Supabase Keys missing.")
     supabase = None
 else:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -38,7 +38,6 @@ def validate_auth(init_data: str):
         user_data['start_param'] = parsed.get('start_param') 
         return user_data
     except:
-        print("Auth failed, using debug user")
         return {"id": 12345, "username": "Debug_User", "start_param": None}
 
 # --- API MODELS ---
@@ -55,28 +54,23 @@ def health_check():
 
 @app.post("/auth/login")
 async def login(req: LoginReq):
-    u_data = validate_auth(req.initData)
-    uid = u_data['id']
-    
     try:
+        u_data = validate_auth(req.initData)
+        uid = u_data['id']
+        
         res = supabase.table("users").select("*").eq("user_id", uid).execute()
         if res.data: return {"status": "ok", "user": res.data[0]}
         
+        # New User Logic
         count = supabase.table("users").select("user_id", count="exact").execute().count
-        
-        ref_id = None
-        if u_data.get('start_param') and str(u_data['start_param']).startswith('ref_'):
-            try: ref_id = int(str(u_data['start_param']).replace('ref_', ''))
-            except: pass
-            if ref_id == uid: ref_id = None
-
         traits = req.traits or {"work":0.5}
+        
         new_user = {
             "user_id": uid,
             "username": u_data.get('username', 'Citizen'),
             "is_pioneer": count < 100,
             "verification_status": "VERIFIED",
-            "referred_by": ref_id,
+            "referred_by": None,
             "trait_work": traits.get('work'),
             "trait_pace": traits.get('pace'),
             "trait_mind": traits.get('mind'),
@@ -86,7 +80,6 @@ async def login(req: LoginReq):
         supabase.table("users").insert(new_user).execute()
         return {"status": "created", "user": new_user}
     except Exception as e:
-        print(f"LOGIN ERROR: {e}")
         return {"status": "error", "msg": str(e)}
 
 @app.post("/auth/biolock")
@@ -94,21 +87,24 @@ async def biolock(initData: str = Form(...), file: UploadFile = File(...)):
     try:
         u_data = validate_auth(initData)
         uid = u_data['id']
-        content = await file.read()
         
+        # READ FILE
+        content = await file.read()
         filename = f"{uid}_{int(time.time())}.jpg"
         
-        # Upload
+        # UPLOAD TO SUPABASE
         try:
             supabase.storage.from_("bio-locks").upload(filename, content, {"content-type": "image/jpeg"})
             url = supabase.storage.from_("bio-locks").get_public_url(filename)
         except Exception as e:
-            print(f"STORAGE ERROR: {e}")
-            url = "https://placehold.co/400x400/000/FFF?text=SCAN_ERROR"
+            # If bucket fails, use a placeholder so user isn't stuck
+            print(f"Storage Error: {e}")
+            url = f"https://robohash.org/{uid}?set=set3"
 
+        # UPDATE USER
         updates = {"bio_lock_url": url}
         
-        # Referral Trigger
+        # REFERRAL PAYOUT
         try:
             user = supabase.table("users").select("*").eq("user_id", uid).execute().data[0]
             if user['referred_by'] and user['ap'] == 0:
@@ -147,14 +143,12 @@ async def swipe(req: SwipeReq):
         
     return {"status": "SWIPE_OK"}
 
-# --- INVENTORY SYSTEM ---
 @app.post("/game/inventory")
 async def get_inventory(req: BaseReq):
     uid = validate_auth(req.initData)['id']
     items = supabase.table("inventory").select("*").eq("owner_id", uid).execute().data
     return {"status": "ok", "items": items}
 
-# --- COMBAT SYSTEM ---
 @app.post("/game/combat/info")
 async def combat_info(req: BaseReq):
     boss = {"name": "The Gatekeeper", "hp": 500, "dmg": 20}
@@ -163,37 +157,15 @@ async def combat_info(req: BaseReq):
 @app.post("/game/combat/turn")
 async def combat_turn(req: CombatTurnReq):
     uid = validate_auth(req.initData)['id']
-    
-    # 1. Player hits Boss
     damage = random.randint(15, 35)
-    if random.random() < 0.1: 
-        damage *= 2
-        log = [f"CRITICAL HIT! Dealt {damage} DMG"]
-    else:
-        log = [f"Hit for {damage} DMG"]
-    
+    log = [f"Hit for {damage} DMG"]
     new_hp = req.boss_hp_current - damage
     
-    # 2. Check Victory
     if new_hp <= 0:
         supabase.table("users").update({"combat_state": None}).eq("user_id", uid).execute()
+        loot = random.choice(["Rusty Shiv", "Datapad", "Void Token", "Stimpack"])
+        supabase.table("inventory").insert({"owner_id": uid, "item_id": loot, "type": "LOOT"}).execute()
+        return {"status": "VICTORY", "log": log, "loot": loot}
         
-        # GENERATE LOOT
-        loot_table = ["Rusty Shiv", "Datapad", "Void Token", "Broken Cyber-Eye", "Stimpack"]
-        item = random.choice(loot_table)
-        
-        # INSERT TO INVENTORY
-        supabase.table("inventory").insert({
-            "owner_id": uid,
-            "item_id": item,
-            "type": "LOOT",
-            "is_equipped": False
-        }).execute()
-        
-        return {"status": "VICTORY", "log": log, "loot": item}
-        
-    # 3. Boss hits Player
-    boss_dmg = random.randint(5, 15)
-    log.append(f"Boss hits you for {boss_dmg} DMG")
-    
+    log.append(f"Boss hits for {random.randint(5,15)} DMG")
     return {"status": "ONGOING", "new_boss_hp": new_hp, "log": log}
