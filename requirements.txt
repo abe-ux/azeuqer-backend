@@ -1,12 +1,13 @@
 fastapi>=0.109.0
 uvicorn>=0.27.0
-# Upgrade Supabase to fix the 'proxy' crash
+# The Brain
 supabase>=2.9.0
+# CRITICAL FIX: Add HTTP2 support required by new Supabase
+httpx[http2]
 python-multipart
 pydantic
 python-dotenv
-# Keep OpenCV compatible
+# Computer Vision (Eyes)
 opencv-python-headless==4.8.1.78
-# Mediapipe requires Numpy < 2
 mediapipe==0.10.9
 numpy<2.0.0
