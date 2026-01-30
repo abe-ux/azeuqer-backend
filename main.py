@@ -153,7 +153,24 @@ async def get_inventory(req: BaseReq):
 async def combat_info(req: BaseReq):
     boss = {"name": "The Gatekeeper", "hp": 500, "dmg": 20}
     return {"boss": boss}
+class EquipReq(BaseModel): initData: str; item_id: str
 
+@app.post("/game/equip")
+async def equip_item(req: EquipReq):
+    uid = validate_auth(req.initData)['id']
+    
+    # 1. Verify Ownership
+    # (Simplified: In prod, check table 'inventory')
+    
+    # 2. Set as Active Stamp on User Profile
+    # We store the item name in a new column or reuse 'sponsor_id' for MVP
+    # Let's use a specific field 'equipped_item' in the 'users' table
+    # NOTE: You might need to run this SQL once: 
+    # ALTER TABLE users ADD COLUMN equipped_item TEXT DEFAULT NULL;
+    
+    supabase.table("users").update({"equipped_item": req.item_id}).eq("user_id", uid).execute()
+    return {"status": "EQUIPPED", "item": req.item_id}
+    
 @app.post("/game/combat/turn")
 async def combat_turn(req: CombatTurnReq):
     uid = validate_auth(req.initData)['id']
