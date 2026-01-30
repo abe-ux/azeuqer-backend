@@ -173,16 +173,43 @@ async def combat_info(req: BaseReq):
     boss = {"name": "The Gatekeeper", "hp": 500, "dmg": 20}
     return {"boss": boss}
 
+# --- REPLACEMENT FOR combat_turn ---
 @app.post("/game/combat/turn")
 async def combat_turn(req: CombatTurnReq):
     uid = validate_auth(req.initData)['id']
-    damage = random.randint(15, 30)
-    new_hp = req.boss_hp_current - damage
-    log = [f"Hit for {damage} DMG"]
     
+    # 1. Player hits Boss
+    damage = random.randint(15, 35)
+    # Crit chance (10%)
+    if random.random() < 0.1: 
+        damage *= 2
+        log = [f"CRITICAL HIT! Dealt {damage} DMG"]
+    else:
+        log = [f"Hit for {damage} DMG"]
+    
+    new_hp = req.boss_hp_current - damage
+    
+    # 2. Check Victory
     if new_hp <= 0:
+        #UNLOCK USER
         supabase.table("users").update({"combat_state": None}).eq("user_id", uid).execute()
-        return {"status": "VICTORY", "log": log}
         
-    log.append(f"Boss hits for {random.randint(5,15)} DMG")
+        # GENERATE LOOT
+        loot_table = ["Rusty Shiv", "Datapad", "Void Token", "Broken Cyber-Eye", "Stimpack"]
+        item = random.choice(loot_table)
+        
+        # INSERT TO INVENTORY
+        supabase.table("inventory").insert({
+            "owner_id": uid,
+            "item_id": item,
+            "type": "LOOT",
+            "is_equipped": False
+        }).execute()
+        
+        return {"status": "VICTORY", "log": log, "loot": item}
+        
+    # 3. Boss hits Player
+    boss_dmg = random.randint(5, 15)
+    log.append(f"Boss hits you for {boss_dmg} DMG")
+    
     return {"status": "ONGOING", "new_boss_hp": new_hp, "log": log}
