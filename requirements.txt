@@ -1,9 +1,13 @@
-fastapi==0.109.2
-uvicorn==0.27.1
-supabase==2.3.4
-python-multipart==0.0.9
-pydantic==2.6.1
+fastapi==0.109.0
+uvicorn==0.27.0
+supabase==2.3.0
+python-multipart==0.0.6
+pydantic==2.6.0
 python-dotenv==1.0.1
-opencv-python-headless==4.9.0.80
+# Pinned to ensure compatibility with Numpy 1.x
+opencv-python-headless==4.8.1.78
+# Mediapipe requires Numpy < 2
 mediapipe==0.10.9
+# Force Numpy 1.x to satisfy Mediapipe
 numpy<2
+gotrue==2.2.0
