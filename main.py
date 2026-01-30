@@ -195,7 +195,32 @@ async def equip_item(req: EquipReq):
     # Set as active stamp
     supabase.table("users").update({"equipped_item": req.item_id}).eq("user_id", uid).execute()
     return {"status": "EQUIPPED", "item": req.item_id}
+class StatReq(BaseModel): initData: str; stat: str # 'STR', 'AGI', 'INT'
 
+@app.post("/game/stats/upgrade")
+async def upgrade_stat(req: StatReq):
+    uid = validate_auth(req.initData)['id']
+    
+    # 1. Fetch User
+    u = supabase.table("users").select("*").eq("user_id", uid).execute().data[0]
+    
+    if u['stat_points_available'] <= 0:
+        return {"status": "ERROR", "msg": "NO_POINTS"}
+        
+    # 2. Determine Column
+    col_map = {"STR": "base_str", "AGI": "base_agi", "INT": "base_int"}
+    col = col_map.get(req.stat)
+    
+    if not col: return {"status": "ERROR"}
+    
+    # 3. Apply Upgrade
+    supabase.table("users").update({
+        col: u[col] + 1,
+        "stat_points_available": u['stat_points_available'] - 1
+    }).eq("user_id", uid).execute()
+    
+    return {"status": "UPGRADED", "new_val": u[col] + 1}
+    
 # --- COMBAT ---
 @app.post("/game/combat/info")
 async def combat_info(req: BaseReq):
