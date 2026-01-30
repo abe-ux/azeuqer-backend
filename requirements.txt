@@ -4,10 +4,8 @@ supabase==2.3.0
 python-multipart==0.0.6
 pydantic==2.6.0
 python-dotenv==1.0.1
-# Pinned to ensure compatibility with Numpy 1.x
+# Pinned for stability
 opencv-python-headless==4.8.1.78
-# Mediapipe requires Numpy < 2
+# Mediapipe needs old numpy
 mediapipe==0.10.9
-# Force Numpy 1.x to satisfy Mediapipe
 numpy<2
-gotrue==2.2.0
