@@ -157,12 +157,15 @@ async def biolock(initData: str = Form(...), file: UploadFile = File(...)):
         print(f"UPLOAD ERROR: {e}")
         return {"status": "error", "msg": str(e)}
 
+# FIND THIS SECTION IN main.py AND REPLACE THE get_feed FUNCTION
 @app.post("/game/feed")
 async def get_feed(req: BaseReq):
     uid = validate_auth(req.initData)['id']
     supabase.table("users").update({"last_active": datetime.utcnow().isoformat()}).eq("user_id", uid).execute()
     
-    users = supabase.table("users").select("*").limit(50).execute().data
+    # EXPLICITLY FETCH SPONSOR DATA
+    users = supabase.table("users").select("user_id, username, bio_lock_url, faction, sponsor_id, is_pioneer, equipped_item").limit(50).execute().data
+    
     final_feed = [u for u in users if u['user_id'] != uid]
     random.shuffle(final_feed)
     
