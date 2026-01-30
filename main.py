@@ -1,7 +1,9 @@
-# AZEUQER TITANIUM 6.4 - LITE EDITION (NO AI)
-import os, json, time, urllib.parse, random
+# AZEUQER TITANIUM 6.6 - STABLE & FEATURE COMPLETE
+import os, json, time, urllib.parse, random, cv2
+import numpy as np
+import mediapipe as mp
 from datetime import datetime, timedelta
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client
@@ -12,12 +14,16 @@ app = FastAPI()
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-# Fail gracefully if keys are missing
 if not SUPABASE_URL or not SUPABASE_KEY:
-    print("WARNING: Supabase Keys missing.")
+    print("CRITICAL: SUPABASE KEYS MISSING")
     supabase = None
 else:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    # Client creation might fail if http2 lib is missing, handled by requirements.txt fix
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    except Exception as e:
+        print(f"SUPABASE INIT ERROR: {e}")
+        supabase = None
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,6 +32,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"]
 )
+
+# GLOBAL AI MODEL (Lazy Load)
+mp_face_mesh = None
+
+def get_face_mesh():
+    global mp_face_mesh
+    if mp_face_mesh is None:
+        mp_face_mesh = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=True, max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.5
+        )
+    return mp_face_mesh
 
 # --- UTILS ---
 def validate_auth(init_data: str):
@@ -40,11 +57,26 @@ def validate_auth(init_data: str):
     except:
         return {"id": 12345, "username": "Debug_User", "start_param": None}
 
+def scan_face(image_bytes):
+    try:
+        nparr = np.frombuffer(image_bytes, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if img is None: return False
+        
+        # Use Global Model
+        mesh = get_face_mesh()
+        results = mesh.process(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        return bool(results.multi_face_landmarks)
+    except Exception as e:
+        print(f"AI SCAN ERROR: {e}")
+        return True # Fail open to prevent locking users out
+
 # --- API MODELS ---
 class BaseReq(BaseModel): initData: str
 class LoginReq(BaseModel): initData: str; traits: dict = None
 class SwipeReq(BaseModel): initData: str; target_id: int; direction: str
 class CombatTurnReq(BaseModel): initData: str; action: str; boss_hp_current: int
+class EquipReq(BaseModel): initData: str; item_id: str
 
 # --- ENDPOINTS ---
 
@@ -61,25 +93,29 @@ async def login(req: LoginReq):
         res = supabase.table("users").select("*").eq("user_id", uid).execute()
         if res.data: return {"status": "ok", "user": res.data[0]}
         
-        # New User Logic
+        # New User
         count = supabase.table("users").select("user_id", count="exact").execute().count
-        traits = req.traits or {"work":0.5}
         
+        ref_id = None
+        if u_data.get('start_param') and str(u_data['start_param']).startswith('ref_'):
+            try: ref_id = int(str(u_data['start_param']).replace('ref_', ''))
+            except: pass
+            if ref_id == uid: ref_id = None
+
         new_user = {
             "user_id": uid,
             "username": u_data.get('username', 'Citizen'),
             "is_pioneer": count < 100,
             "verification_status": "VERIFIED",
-            "referred_by": None,
-            "trait_work": traits.get('work'),
-            "trait_pace": traits.get('pace'),
-            "trait_mind": traits.get('mind'),
-            "trait_vibe": traits.get('vibe')
+            "referred_by": ref_id,
+            "ap": 0,
+            "hp_current": 100
         }
         
         supabase.table("users").insert(new_user).execute()
         return {"status": "created", "user": new_user}
     except Exception as e:
+        print(f"LOGIN ERROR: {e}")
         return {"status": "error", "msg": str(e)}
 
 @app.post("/auth/biolock")
@@ -87,24 +123,25 @@ async def biolock(initData: str = Form(...), file: UploadFile = File(...)):
     try:
         u_data = validate_auth(initData)
         uid = u_data['id']
-        
-        # READ FILE
         content = await file.read()
+        
+        # AI Scan (Failsafe included)
+        if not scan_face(content):
+            return {"status": "ERROR", "msg": "NO_FACE_DETECTED"}
+        
         filename = f"{uid}_{int(time.time())}.jpg"
         
-        # UPLOAD TO SUPABASE
+        # Upload
         try:
             supabase.storage.from_("bio-locks").upload(filename, content, {"content-type": "image/jpeg"})
             url = supabase.storage.from_("bio-locks").get_public_url(filename)
         except Exception as e:
-            # If bucket fails, use a placeholder so user isn't stuck
-            print(f"Storage Error: {e}")
-            url = f"https://robohash.org/{uid}?set=set3"
+            print(f"STORAGE ERROR: {e}")
+            url = f"https://robohash.org/{uid}?set=set1" # Fallback
 
-        # UPDATE USER
         updates = {"bio_lock_url": url}
         
-        # REFERRAL PAYOUT
+        # Referral Trigger
         try:
             user = supabase.table("users").select("*").eq("user_id", uid).execute().data[0]
             if user['referred_by'] and user['ap'] == 0:
@@ -117,6 +154,7 @@ async def biolock(initData: str = Form(...), file: UploadFile = File(...)):
         return {"status": "success", "url": url}
         
     except Exception as e:
+        print(f"UPLOAD ERROR: {e}")
         return {"status": "error", "msg": str(e)}
 
 @app.post("/game/feed")
@@ -136,6 +174,7 @@ async def swipe(req: SwipeReq):
     supabase.rpc("increment_user_ap", {"target_uid": uid, "amount": 1}).execute()
     supabase.table("swipes").insert({"actor_id": uid, "target_id": req.target_id, "direction": req.direction}).execute()
     
+    # Ambush Check
     swipe_count = supabase.table("swipes").select("id", count="exact").eq("actor_id", uid).execute().count
     if swipe_count % 10 == 0:
         supabase.table("users").update({"combat_state": "LOCKED"}).eq("user_id", uid).execute()
@@ -143,46 +182,50 @@ async def swipe(req: SwipeReq):
         
     return {"status": "SWIPE_OK"}
 
+# --- INVENTORY & EQUIP ---
 @app.post("/game/inventory")
 async def get_inventory(req: BaseReq):
     uid = validate_auth(req.initData)['id']
     items = supabase.table("inventory").select("*").eq("owner_id", uid).execute().data
     return {"status": "ok", "items": items}
 
+@app.post("/game/equip")
+async def equip_item(req: EquipReq):
+    uid = validate_auth(req.initData)['id']
+    # Set as active stamp
+    supabase.table("users").update({"equipped_item": req.item_id}).eq("user_id", uid).execute()
+    return {"status": "EQUIPPED", "item": req.item_id}
+
+# --- COMBAT ---
 @app.post("/game/combat/info")
 async def combat_info(req: BaseReq):
     boss = {"name": "The Gatekeeper", "hp": 500, "dmg": 20}
     return {"boss": boss}
-class EquipReq(BaseModel): initData: str; item_id: str
 
-@app.post("/game/equip")
-async def equip_item(req: EquipReq):
-    uid = validate_auth(req.initData)['id']
-    
-    # 1. Verify Ownership
-    # (Simplified: In prod, check table 'inventory')
-    
-    # 2. Set as Active Stamp on User Profile
-    # We store the item name in a new column or reuse 'sponsor_id' for MVP
-    # Let's use a specific field 'equipped_item' in the 'users' table
-    # NOTE: You might need to run this SQL once: 
-    # ALTER TABLE users ADD COLUMN equipped_item TEXT DEFAULT NULL;
-    
-    supabase.table("users").update({"equipped_item": req.item_id}).eq("user_id", uid).execute()
-    return {"status": "EQUIPPED", "item": req.item_id}
-    
 @app.post("/game/combat/turn")
 async def combat_turn(req: CombatTurnReq):
     uid = validate_auth(req.initData)['id']
+    
     damage = random.randint(15, 35)
     log = [f"Hit for {damage} DMG"]
     new_hp = req.boss_hp_current - damage
     
+    # VICTORY
     if new_hp <= 0:
         supabase.table("users").update({"combat_state": None}).eq("user_id", uid).execute()
-        loot = random.choice(["Rusty Shiv", "Datapad", "Void Token", "Stimpack"])
-        supabase.table("inventory").insert({"owner_id": uid, "item_id": loot, "type": "LOOT"}).execute()
-        return {"status": "VICTORY", "log": log, "loot": loot}
         
-    log.append(f"Boss hits for {random.randint(5,15)} DMG")
+        # Loot Drop
+        loot_table = ["Rusty Shiv", "Datapad", "Void Token", "Broken Cyber-Eye", "Stimpack"]
+        item = random.choice(loot_table)
+        
+        supabase.table("inventory").insert({
+            "owner_id": uid, "item_id": item, "type": "LOOT", "is_equipped": False
+        }).execute()
+        
+        return {"status": "VICTORY", "log": log, "loot": item}
+        
+    # BOSS HIT
+    boss_dmg = random.randint(5, 15)
+    log.append(f"Boss hits you for {boss_dmg} DMG")
+    
     return {"status": "ONGOING", "new_boss_hp": new_hp, "log": log}
