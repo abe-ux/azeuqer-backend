@@ -1,9 +1,8 @@
-# AZEUQER TITANIUM 6.1 - STABILIZED BACKEND
+# AZEUQER TITANIUM 6.2 - LOOT & PROFILE EDITION
 import os, json, time, urllib.parse, random, cv2
 import numpy as np
-# import mediapipe as mp # DISABLED TO SAVE RAM
 from datetime import datetime, timedelta
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form # ADDED FORM
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from supabase import create_client
@@ -39,7 +38,6 @@ def validate_auth(init_data: str):
         user_data['start_param'] = parsed.get('start_param') 
         return user_data
     except:
-        # Fallback for testing if auth fails
         print("Auth failed, using debug user")
         return {"id": 12345, "username": "Debug_User", "start_param": None}
 
@@ -47,10 +45,7 @@ def validate_auth(init_data: str):
 class BaseReq(BaseModel): initData: str
 class LoginReq(BaseModel): initData: str; traits: dict = None
 class SwipeReq(BaseModel): initData: str; target_id: int; direction: str
-class SponsorReq(BaseModel): initData: str; sponsor_logo: str
-class DonateReq(BaseModel): initData: str; amount: int
 class CombatTurnReq(BaseModel): initData: str; action: str; boss_hp_current: int
-class VoteReq(BaseModel): initData: str; target_id: int; vote: str
 
 # --- ENDPOINTS ---
 
@@ -80,7 +75,7 @@ async def login(req: LoginReq):
             "user_id": uid,
             "username": u_data.get('username', 'Citizen'),
             "is_pioneer": count < 100,
-            "verification_status": "VERIFIED", # Auto-verify for now
+            "verification_status": "VERIFIED",
             "referred_by": ref_id,
             "trait_work": traits.get('work'),
             "trait_pace": traits.get('pace'),
@@ -94,38 +89,26 @@ async def login(req: LoginReq):
         print(f"LOGIN ERROR: {e}")
         return {"status": "error", "msg": str(e)}
 
-# --- THE CRITICAL FIX IS HERE ---
 @app.post("/auth/biolock")
 async def biolock(initData: str = Form(...), file: UploadFile = File(...)):
-    # NOTE: We use Form(...) instead of Body(...) because this is a multipart request
-    print("Received Biolock Request") 
-    
     try:
         u_data = validate_auth(initData)
         uid = u_data['id']
-        
         content = await file.read()
-        
-        # --- AI SCAN DISABLED FOR STABILITY ---
-        # if not scan_face(content): return {"status": "ERROR", "msg": "NO_FACE"}
         
         filename = f"{uid}_{int(time.time())}.jpg"
         
-        print(f"Uploading {filename}...")
-        
-        # Upload to Supabase
+        # Upload
         try:
             supabase.storage.from_("bio-locks").upload(filename, content, {"content-type": "image/jpeg"})
             url = supabase.storage.from_("bio-locks").get_public_url(filename)
         except Exception as e:
             print(f"STORAGE ERROR: {e}")
-            # Fallback URL if storage fails (prevents getting stuck)
             url = "https://placehold.co/400x400/000/FFF?text=SCAN_ERROR"
 
-        # Update User
         updates = {"bio_lock_url": url}
         
-        # Referral Payout
+        # Referral Trigger
         try:
             user = supabase.table("users").select("*").eq("user_id", uid).execute().data[0]
             if user['referred_by'] and user['ap'] == 0:
@@ -138,7 +121,6 @@ async def biolock(initData: str = Form(...), file: UploadFile = File(...)):
         return {"status": "success", "url": url}
         
     except Exception as e:
-        print(f"CRITICAL UPLOAD FAILURE: {e}")
         return {"status": "error", "msg": str(e)}
 
 @app.post("/game/feed")
@@ -146,7 +128,6 @@ async def get_feed(req: BaseReq):
     uid = validate_auth(req.initData)['id']
     supabase.table("users").update({"last_active": datetime.utcnow().isoformat()}).eq("user_id", uid).execute()
     
-    # Simple Feed Fetch
     users = supabase.table("users").select("*").limit(50).execute().data
     final_feed = [u for u in users if u['user_id'] != uid]
     random.shuffle(final_feed)
@@ -159,7 +140,6 @@ async def swipe(req: SwipeReq):
     supabase.rpc("increment_user_ap", {"target_uid": uid, "amount": 1}).execute()
     supabase.table("swipes").insert({"actor_id": uid, "target_id": req.target_id, "direction": req.direction}).execute()
     
-    # Ambush Check
     swipe_count = supabase.table("swipes").select("id", count="exact").eq("actor_id", uid).execute().count
     if swipe_count % 10 == 0:
         supabase.table("users").update({"combat_state": "LOCKED"}).eq("user_id", uid).execute()
@@ -167,20 +147,25 @@ async def swipe(req: SwipeReq):
         
     return {"status": "SWIPE_OK"}
 
-# --- COMBAT ---
+# --- INVENTORY SYSTEM ---
+@app.post("/game/inventory")
+async def get_inventory(req: BaseReq):
+    uid = validate_auth(req.initData)['id']
+    items = supabase.table("inventory").select("*").eq("owner_id", uid).execute().data
+    return {"status": "ok", "items": items}
+
+# --- COMBAT SYSTEM ---
 @app.post("/game/combat/info")
 async def combat_info(req: BaseReq):
     boss = {"name": "The Gatekeeper", "hp": 500, "dmg": 20}
     return {"boss": boss}
 
-# --- REPLACEMENT FOR combat_turn ---
 @app.post("/game/combat/turn")
 async def combat_turn(req: CombatTurnReq):
     uid = validate_auth(req.initData)['id']
     
     # 1. Player hits Boss
     damage = random.randint(15, 35)
-    # Crit chance (10%)
     if random.random() < 0.1: 
         damage *= 2
         log = [f"CRITICAL HIT! Dealt {damage} DMG"]
@@ -191,7 +176,6 @@ async def combat_turn(req: CombatTurnReq):
     
     # 2. Check Victory
     if new_hp <= 0:
-        #UNLOCK USER
         supabase.table("users").update({"combat_state": None}).eq("user_id", uid).execute()
         
         # GENERATE LOOT
