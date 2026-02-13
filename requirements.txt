@@ -1,11 +1,8 @@
-fastapi==0.109.0
-uvicorn==0.27.0
+fastapi
+uvicorn
 python-multipart
 pydantic
 python-dotenv
-# THE FIXES
-supabase==2.3.4
-gotrue==2.3.0
-httpx==0.26.0
-httpcore==1.0.2
-h2==4.1.0
+supabase
+h2
+httpx
