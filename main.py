@@ -86,3 +86,14 @@ async def upload_biolock(initData: str = Form(...), file: UploadFile = File(...)
     except Exception as e:
         print(f"UPLOAD ERROR: {e}")
         return {"status": "error", "msg": str(e)}
+# ADD THIS TO THE BOTTOM OF main.py
+@app.post("/auth/reset")
+async def reset_user(req: dict):
+    try:
+        u_data = validate_auth(req.get('initData'))
+        uid = u_data['id']
+        # Wipe the bio_lock_url to force re-entry
+        supabase.table("users").update({"bio_lock_url": None}).eq("user_id", uid).execute()
+        return {"status": "RESET_COMPLETE"}
+    except Exception as e:
+        return {"status": "error", "msg": str(e)}
