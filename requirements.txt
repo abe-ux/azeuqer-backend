@@ -1,8 +1,15 @@
-fastapi
-uvicorn
-python-multipart
-pydantic
-python-dotenv
-supabase
 h2
 httpx
+pydantic
+python-dotenv
+fastapi==0.115.0
+uvicorn==0.30.6
+python-multipart==0.0.9
+supabase==2.7.4
+
+# Image decoding
+Pillow==10.4.0
+
+# Bio-lock face scan (server-side)
+mediapipe==0.10.14
+numpy==1.26.4
