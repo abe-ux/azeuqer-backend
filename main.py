@@ -94,6 +94,8 @@ def _ensure_user(tg_id: int, username: str) -> Dict[str, Any]:
         patch = {}
         if u.get("ap") is None: patch["ap"] = 0
         if u.get("faction") is None: patch["faction"] = "UNSORTED"
+        if "equipped_item" not in u: patch["equipped_item"] = None
+        if "bio_lock_url" not in u: patch["bio_lock_url"] = None
         if patch:
             supabase.table("users").update(patch).eq("tg_id", tg_id).execute()
             u.update(patch)
@@ -143,6 +145,10 @@ async def login(req: dict):
         tg_id = int(u_data["id"])
         username = u_data.get("username", "Citizen")
         u = _ensure_user(tg_id, username)
+
+        # ✅ IMPORTANT COMPAT: add user_id alias for frontend
+        u["user_id"] = u.get("tg_id")
+
         return {"status": "ok", "user": u}
     except Exception as e:
         return {"status": "error", "msg": str(e)}
@@ -213,7 +219,7 @@ async def game_feed(req: dict):
             .execute()
         )
 
-        # Frontend expects user_id; we can alias in payload for compatibility:
+        # Frontend expects user_id; alias it
         feed = []
         for row in (res.data or []):
             feed.append({
@@ -271,7 +277,6 @@ async def game_swipe(req: dict):
         threshold = 0.15 if direction == "LIGHT" else 0.05
         if roll < threshold:
             loot_drop = random.choice(_loot_table())
-            # Optional inventory table: if missing, ignore
             try:
                 _grant_loot(tg_id, loot_drop, qty=1)
             except Exception:
@@ -299,7 +304,6 @@ async def game_inventory(req: dict):
             it["qty"] = _safe_int(it.get("qty"), 0)
         return {"status": "ok", "items": items}
     except Exception as e:
-        # If inventory table doesn't exist yet, return empty instead of failing hard
         return {"status": "error", "msg": str(e), "items": []}
 
 
@@ -318,7 +322,7 @@ async def game_equip(req: dict):
         if not item_id:
             return {"status": "error", "msg": "NO_ITEM_ID"}
 
-        # Verify owned (if inventory exists)
+        # Verify owned
         inv = supabase.table("inventory").select("qty").eq("tg_id", tg_id).eq("item_id", item_id).limit(1).execute()
         if not inv.data or _safe_int(inv.data[0].get("qty"), 0) <= 0:
             return {"status": "error", "msg": "NOT_OWNED"}
@@ -344,7 +348,7 @@ async def combat_info(req: dict):
         user = _ensure_user(tg_id, u_data.get("username", "Citizen"))
 
         ap = _safe_int(user.get("ap"), 0)
-        base_hp = 25 + min(ap // 5, 25)  # scales up to +25
+        base_hp = 25 + min(ap // 5, 25)
         boss = {"name": "AMBUSH DEMON", "hp": base_hp, "max_hp": base_hp, "lvl": 1 + min(ap // 10, 20)}
         return {"status": "ok", "boss": boss}
     except Exception as e:
@@ -370,7 +374,6 @@ async def combat_turn(req: dict):
         boss_hp = _safe_int(req.get("boss_hp_current"), -1)
         if boss_hp < 0:
             return {"status": "error", "msg": "BAD_BOSS_HP"}
-
         boss_hp = max(0, boss_hp)
 
         if action == "ATTACK":
@@ -385,7 +388,6 @@ async def combat_turn(req: dict):
                 except Exception:
                     loot = None
 
-                # reward AP for victory
                 new_ap = ap + 2
                 supabase.table("users").update({"ap": new_ap}).eq("tg_id", tg_id).execute()
 
@@ -394,11 +396,9 @@ async def combat_turn(req: dict):
             return {"status": "ONGOING", "new_boss_hp": new_hp}
 
         if action == "POTION_HP":
-            # prototype: potion costs 1 AP, no boss change
             ap = _safe_int(user.get("ap"), 0)
             if ap <= 0:
                 return {"status": "ONGOING", "new_boss_hp": boss_hp, "msg": "NO_AP"}
-
             new_ap = ap - 1
             supabase.table("users").update({"ap": new_ap}).eq("tg_id", tg_id).execute()
             return {"status": "ONGOING", "new_boss_hp": boss_hp, "new_ap": new_ap}
