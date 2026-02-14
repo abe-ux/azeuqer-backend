@@ -1,9 +1,8 @@
-# AZEUQER TITANIUM — PROMPT 1.1 + 1.2 (+ keeps 1.3 strict Bio-Lock + /profile/vessel)
-# - Referral Engine (deep link start_param)
-# - Pioneer Protocol (first N users auto-VERIFIED)
-# - Referral payout triggers AFTER Bio-Lock PASS
-# - Anti-double pay via referral_ledger
-# - Strict Bio-Lock via MediaPipe FaceDetection
+# AZEUQER TITANIUM — PROMPT 1.1 + 1.2 + 1.3 + 1.4 (FULL BACKEND)
+# - Referral Engine + Pioneer Protocol
+# - Strict Bio-Lock (MediaPipe)
+# - Vessel sliders => body_asset_id (cosmetic)
+# - /profile/vessel endpoint now stores slider values + body_asset_id
 
 import os, json, time, urllib.parse, re
 from typing import Any, Dict, Optional, Tuple
@@ -117,10 +116,10 @@ def _count_users_exact() -> int:
 def _ensure_user(user_id: int, username: str, referred_by: Optional[int]) -> Dict[str, Any]:
     """
     Creates user if missing.
-    Referral is stored ONLY at creation time (immutable entry vector).
+    Referral is stored ONLY at creation time.
     Pioneer Protocol:
-      - if count < pioneer_cap => role=PIONEER, verification_status=VERIFIED
-      - else role=CITIZEN, verification_status=PENDING
+      - first N users => PIONEER + VERIFIED
+      - else CITIZEN + PENDING
     """
     existing = _get_user(user_id)
     if existing:
@@ -161,10 +160,17 @@ def _ensure_user(user_id: int, username: str, referred_by: Optional[int]) -> Dic
         "energy": starting_energy,
         "energy_updated_at": "now()",
 
+        # vessel (cosmetic)
         "body_asset_id": None,
+        "vessel_work": 50,
+        "vessel_pace": 50,
+        "vessel_mind": 50,
+        "vessel_vibe": 50,
+
+        # referral
         "referral_status": "NONE",
 
-        # Bio-lock tracking (Prompt 1.3)
+        # biolock tracking
         "biolock_status": "GATE",
         "biolock_attempts": 0,
         "biolock_last_error": None,
@@ -177,7 +183,6 @@ def _ensure_user(user_id: int, username: str, referred_by: Optional[int]) -> Dic
 
     supabase.table("users").insert(new_row).execute()
 
-    # create referral ledger row if table exists
     if new_row.get("referred_by"):
         bonus = _get_config_int("referral_bonus_ap", 100)
         try:
@@ -201,10 +206,6 @@ def _award_ap(user_id: int, amount: int) -> int:
     return new_ap
 
 def _trigger_referral_payout(invitee_user_id: int) -> Dict[str, Any]:
-    """
-    Pays inviter + invitee only when invitee has bio_lock_url and face scan PASS.
-    Prevents double-pay with referral_ledger if available.
-    """
     invitee = _get_user(invitee_user_id)
     if not invitee:
         return {"status": "error", "msg": "INVITEE_NOT_FOUND"}
@@ -219,7 +220,6 @@ def _trigger_referral_payout(invitee_user_id: int) -> Dict[str, Any]:
     inviter_id = int(inviter_id)
     bonus = _get_config_int("referral_bonus_ap", 100)
 
-    # ledger check
     try:
         led = (
             supabase.table("referral_ledger")
@@ -232,7 +232,7 @@ def _trigger_referral_payout(invitee_user_id: int) -> Dict[str, Any]:
         if led.data and led.data[0].get("status") == "PAID":
             return {"status": "noop", "msg": "ALREADY_PAID"}
     except Exception:
-        led = None
+        pass
 
     inviter_ap = _award_ap(inviter_id, bonus)
     invitee_ap = _award_ap(invitee_user_id, bonus)
@@ -252,16 +252,6 @@ def _trigger_referral_payout(invitee_user_id: int) -> Dict[str, Any]:
         "inviter_ap": inviter_ap,
         "invitee_ap": invitee_ap
     }
-
-def _sanitize_body_asset_id(asset: str) -> Optional[str]:
-    if not asset:
-        return None
-    asset = asset.strip()
-    if len(asset) > 80:
-        return None
-    if re.fullmatch(r"body_(low|mid|high)_(low|mid|high)_(low|mid|high)_(low|mid|high)\.png", asset):
-        return asset
-    return None
 
 def _decode_image_bytes(content: bytes) -> Tuple[Optional[np.ndarray], Optional[str]]:
     from io import BytesIO
@@ -324,6 +314,17 @@ def _biolock_pass(user_id: int):
     except Exception:
         pass
 
+def _slider_to_band(v: int) -> str:
+    # 0-33 low, 34-66 mid, 67-100 high
+    if v <= 33:
+        return "low"
+    if v <= 66:
+        return "mid"
+    return "high"
+
+def _make_body_asset_id(work: int, pace: int, mind: int, vibe: int) -> str:
+    return f"body_{_slider_to_band(work)}_{_slider_to_band(pace)}_{_slider_to_band(mind)}_{_slider_to_band(vibe)}.png"
+
 
 # --------------------
 # ENDPOINTS
@@ -334,46 +335,27 @@ def health_check():
 
 @app.post("/auth/login")
 async def login(req: dict):
-    """
-    Referral Engine:
-      - reads start_param from initData OR req.start_param
-      - if ref exists and user is new, stores referred_by and referral_status=PENDING
-    Pioneer Protocol:
-      - first N users => PIONEER + VERIFIED
-    """
     try:
         _require_supabase()
 
         init_data = req.get("initData") or ""
         u_data = validate_auth(init_data)
-
         user_id = int(u_data["id"])
         username = u_data.get("username", "Citizen")
 
-        # referral sources:
         start_param = u_data.get("start_param") or (req.get("start_param") or "")
         ref = _parse_referral(start_param)
 
         user = _ensure_user(user_id, username, ref)
-
-        # response helpers
         user = _get_user(user_id) or user
         user["user_id"] = user_id
         user["tg_id"] = user.get("tg_id") or user_id
-
         return {"status": "ok", "user": user}
     except Exception as e:
         return {"status": "error", "msg": str(e)}
 
 @app.post("/auth/biolock")
 async def upload_biolock(initData: str = Form(...), file: UploadFile = File(...)):
-    """
-    Strict Bio-Lock:
-      - decode image
-      - face scan (exactly 1 face, big enough)
-      - PASS => upload storage + bio_lock_url + biolock_status=PASS
-      - triggers referral payout if referral_status pending
-    """
     try:
         _require_supabase()
 
@@ -393,7 +375,6 @@ async def upload_biolock(initData: str = Form(...), file: UploadFile = File(...)
             _biolock_fail(user_id, scan_code)
             return {"status": "error", "msg": scan_code}
 
-        # PASS -> upload
         filename = f"{user_id}_{int(time.time())}.jpg"
         try:
             supabase.storage.from_("bio-locks").upload(filename, content, {"content-type": "image/jpeg"})
@@ -403,7 +384,6 @@ async def upload_biolock(initData: str = Form(...), file: UploadFile = File(...)
             _biolock_fail(user_id, "BUCKET_FAIL")
             return {"status": "error", "msg": "BUCKET_FAIL"}
 
-        # save + mark pass
         supabase.table("users").update({"bio_lock_url": url}).eq("user_id", user_id).execute()
         _biolock_pass(user_id)
 
@@ -427,6 +407,11 @@ async def reset_user(req: dict):
         supabase.table("users").update({
             "bio_lock_url": None,
             "equipped_item": None,
+            "body_asset_id": None,
+            "vessel_work": 50,
+            "vessel_pace": 50,
+            "vessel_mind": 50,
+            "vessel_vibe": 50,
             "referral_status": "BROKEN",
             "biolock_status": "GATE",
             "biolock_last_error": None,
@@ -444,6 +429,10 @@ async def reset_user(req: dict):
 
 @app.post("/profile/vessel")
 async def profile_vessel(req: dict):
+    """
+    Stores 4 sliders (0-100) + computed body_asset_id.
+    Cosmetic only.
+    """
     try:
         _require_supabase()
 
@@ -452,11 +441,18 @@ async def profile_vessel(req: dict):
         user_id = int(u_data["id"])
         _ensure_user(user_id, u_data.get("username", "Citizen"), referred_by=None)
 
-        body_asset_id = _sanitize_body_asset_id(req.get("body_asset_id") or "")
-        if not body_asset_id:
-            return {"status": "error", "msg": "BAD_BODY_ASSET_ID"}
+        work = max(0, min(100, _safe_int(req.get("work"), 50)))
+        pace = max(0, min(100, _safe_int(req.get("pace"), 50)))
+        mind = max(0, min(100, _safe_int(req.get("mind"), 50)))
+        vibe = max(0, min(100, _safe_int(req.get("vibe"), 50)))
+
+        body_asset_id = _make_body_asset_id(work, pace, mind, vibe)
 
         supabase.table("users").update({
+            "vessel_work": work,
+            "vessel_pace": pace,
+            "vessel_mind": mind,
+            "vessel_vibe": vibe,
             "body_asset_id": body_asset_id,
             "last_active": "now()"
         }).eq("user_id", user_id).execute()
