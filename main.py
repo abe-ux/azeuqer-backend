@@ -1,9 +1,9 @@
-# AZEUQER TITANIUM — PROMPT 1.3 BIO-LOCK (FULL BACKEND)
-# Includes:
-# - /auth/login (referral capture + pioneer + verification)
-# - /auth/biolock (MediaPipe face scan + upload + referral payout)
-# - /auth/reset
-# - /profile/vessel (stores body_asset_id)
+# AZEUQER TITANIUM — PROMPT 1.1 + 1.2 (+ keeps 1.3 strict Bio-Lock + /profile/vessel)
+# - Referral Engine (deep link start_param)
+# - Pioneer Protocol (first N users auto-VERIFIED)
+# - Referral payout triggers AFTER Bio-Lock PASS
+# - Anti-double pay via referral_ledger
+# - Strict Bio-Lock via MediaPipe FaceDetection
 
 import os, json, time, urllib.parse, re
 from typing import Any, Dict, Optional, Tuple
@@ -14,7 +14,6 @@ from supabase import create_client
 
 from PIL import Image
 import numpy as np
-
 import mediapipe as mp
 
 
@@ -41,7 +40,7 @@ app.add_middleware(
 )
 
 # --------------------
-# MediaPipe Face Detector (global, reused)
+# MediaPipe Face Detector
 # --------------------
 mp_face = mp.solutions.face_detection
 FACE_DETECTOR = mp_face.FaceDetection(model_selection=1, min_detection_confidence=0.6)
@@ -80,6 +79,9 @@ def validate_auth(init_data: str) -> Dict[str, Any]:
         return {"id": 12345, "username": "Debug_User", "start_param": ""}
 
 def _parse_referral(start_param: str) -> Optional[int]:
+    """
+    Accepts: ref_12345 OR ref12345
+    """
     if not start_param:
         return None
     s = start_param.strip()
@@ -113,6 +115,13 @@ def _count_users_exact() -> int:
         return len(res.data or [])
 
 def _ensure_user(user_id: int, username: str, referred_by: Optional[int]) -> Dict[str, Any]:
+    """
+    Creates user if missing.
+    Referral is stored ONLY at creation time (immutable entry vector).
+    Pioneer Protocol:
+      - if count < pioneer_cap => role=PIONEER, verification_status=VERIFIED
+      - else role=CITIZEN, verification_status=PENDING
+    """
     existing = _get_user(user_id)
     if existing:
         patch = {"last_active": "now()"}
@@ -155,7 +164,7 @@ def _ensure_user(user_id: int, username: str, referred_by: Optional[int]) -> Dic
         "body_asset_id": None,
         "referral_status": "NONE",
 
-        # Bio-lock fields
+        # Bio-lock tracking (Prompt 1.3)
         "biolock_status": "GATE",
         "biolock_attempts": 0,
         "biolock_last_error": None,
@@ -168,6 +177,7 @@ def _ensure_user(user_id: int, username: str, referred_by: Optional[int]) -> Dic
 
     supabase.table("users").insert(new_row).execute()
 
+    # create referral ledger row if table exists
     if new_row.get("referred_by"):
         bonus = _get_config_int("referral_bonus_ap", 100)
         try:
@@ -191,6 +201,10 @@ def _award_ap(user_id: int, amount: int) -> int:
     return new_ap
 
 def _trigger_referral_payout(invitee_user_id: int) -> Dict[str, Any]:
+    """
+    Pays inviter + invitee only when invitee has bio_lock_url and face scan PASS.
+    Prevents double-pay with referral_ledger if available.
+    """
     invitee = _get_user(invitee_user_id)
     if not invitee:
         return {"status": "error", "msg": "INVITEE_NOT_FOUND"}
@@ -199,12 +213,13 @@ def _trigger_referral_payout(invitee_user_id: int) -> Dict[str, Any]:
     if not inviter_id:
         return {"status": "noop", "msg": "NO_REFERRAL"}
 
-    if not invitee.get("bio_lock_url"):
+    if not invitee.get("bio_lock_url") or invitee.get("biolock_status") != "PASS":
         return {"status": "blocked", "msg": "BIOLOCK_NOT_DONE"}
 
     inviter_id = int(inviter_id)
     bonus = _get_config_int("referral_bonus_ap", 100)
 
+    # ledger check
     try:
         led = (
             supabase.table("referral_ledger")
@@ -217,7 +232,7 @@ def _trigger_referral_payout(invitee_user_id: int) -> Dict[str, Any]:
         if led.data and led.data[0].get("status") == "PAID":
             return {"status": "noop", "msg": "ALREADY_PAID"}
     except Exception:
-        pass
+        led = None
 
     inviter_ap = _award_ap(inviter_id, bonus)
     invitee_ap = _award_ap(invitee_user_id, bonus)
@@ -249,11 +264,9 @@ def _sanitize_body_asset_id(asset: str) -> Optional[str]:
     return None
 
 def _decode_image_bytes(content: bytes) -> Tuple[Optional[np.ndarray], Optional[str]]:
-    """
-    Returns (rgb_image_np, error_code)
-    """
+    from io import BytesIO
     try:
-        img = Image.open(io_bytes(content))
+        img = Image.open(BytesIO(content))
         img = img.convert("RGB")
         arr = np.array(img)
         if arr.ndim != 3 or arr.shape[2] != 3:
@@ -265,48 +278,25 @@ def _decode_image_bytes(content: bytes) -> Tuple[Optional[np.ndarray], Optional[
     except Exception:
         return None, "BAD_IMAGE"
 
-def io_bytes(b: bytes):
-    # tiny helper so we don't import BytesIO at top-level as "find/replace"
-    from io import BytesIO
-    return BytesIO(b)
-
 def _face_scan(rgb_np: np.ndarray) -> Tuple[bool, str]:
-    """
-    Returns (pass, error_code)
-    Rules:
-    - must detect exactly 1 face
-    - score >= 0.6
-    - face bbox must be "large enough" (anti tiny/print)
-    """
     results = FACE_DETECTOR.process(rgb_np)
-
     if not results.detections:
         return False, "NO_FACE"
-
     dets = results.detections
     if len(dets) > 1:
         return False, "MULTI_FACE"
-
     det = dets[0]
     score = float(det.score[0]) if det.score else 0.0
     if score < 0.6:
         return False, "LOW_CONF"
-
     bbox = det.location_data.relative_bounding_box
-    # bbox is relative [0..1]
     w_rel = float(bbox.width or 0.0)
     h_rel = float(bbox.height or 0.0)
-
-    # Require face occupies at least ~12% of image area
     if (w_rel * h_rel) < 0.12:
         return False, "FACE_TOO_SMALL"
-
     return True, "PASS"
 
 def _biolock_fail(user_id: int, err_code: str):
-    """
-    Track attempt and last error in users.
-    """
     try:
         u = _get_user(user_id) or {}
         attempts = _safe_int(u.get("biolock_attempts"), 0) + 1
@@ -321,9 +311,6 @@ def _biolock_fail(user_id: int, err_code: str):
         pass
 
 def _biolock_pass(user_id: int):
-    """
-    Mark pass.
-    """
     try:
         u = _get_user(user_id) or {}
         attempts = _safe_int(u.get("biolock_attempts"), 0) + 1
@@ -347,6 +334,13 @@ def health_check():
 
 @app.post("/auth/login")
 async def login(req: dict):
+    """
+    Referral Engine:
+      - reads start_param from initData OR req.start_param
+      - if ref exists and user is new, stores referred_by and referral_status=PENDING
+    Pioneer Protocol:
+      - first N users => PIONEER + VERIFIED
+    """
     try:
         _require_supabase()
 
@@ -356,13 +350,14 @@ async def login(req: dict):
         user_id = int(u_data["id"])
         username = u_data.get("username", "Citizen")
 
-        start_param = u_data.get("start_param") or ""
-        ref1 = _parse_referral(start_param)
-        ref2 = _safe_int(req.get("ref"), 0) or None
-        referred_by = ref1 or ref2
+        # referral sources:
+        start_param = u_data.get("start_param") or (req.get("start_param") or "")
+        ref = _parse_referral(start_param)
 
-        user = _ensure_user(user_id, username, referred_by)
+        user = _ensure_user(user_id, username, ref)
 
+        # response helpers
+        user = _get_user(user_id) or user
         user["user_id"] = user_id
         user["tg_id"] = user.get("tg_id") or user_id
 
@@ -373,11 +368,11 @@ async def login(req: dict):
 @app.post("/auth/biolock")
 async def upload_biolock(initData: str = Form(...), file: UploadFile = File(...)):
     """
-    Prompt 1.3:
-    - decode image
-    - mediapipe face scan
-    - pass => upload + bio_lock_url + mark PASS + referral payout
-    - fail => mark FAIL + error code
+    Strict Bio-Lock:
+      - decode image
+      - face scan (exactly 1 face, big enough)
+      - PASS => upload storage + bio_lock_url + biolock_status=PASS
+      - triggers referral payout if referral_status pending
     """
     try:
         _require_supabase()
@@ -408,7 +403,7 @@ async def upload_biolock(initData: str = Form(...), file: UploadFile = File(...)
             _biolock_fail(user_id, "BUCKET_FAIL")
             return {"status": "error", "msg": "BUCKET_FAIL"}
 
-        # Save URL + mark PASS
+        # save + mark pass
         supabase.table("users").update({"bio_lock_url": url}).eq("user_id", user_id).execute()
         _biolock_pass(user_id)
 
@@ -455,7 +450,6 @@ async def profile_vessel(req: dict):
         init_data = req.get("initData") or ""
         u_data = validate_auth(init_data)
         user_id = int(u_data["id"])
-
         _ensure_user(user_id, u_data.get("username", "Citizen"), referred_by=None)
 
         body_asset_id = _sanitize_body_asset_id(req.get("body_asset_id") or "")
