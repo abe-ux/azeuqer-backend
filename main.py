@@ -1,12 +1,16 @@
-# AZEUQER TITANIUM 13.x - MODULES: IDENTITY + PROFILE + INVENTORY + COMBAT
+# AZEUQER TITANIUM 13.2 - MODULES: IDENTITY + PROFILE + INVENTORY + FEED + COMBAT
+# Copy-paste this whole file over your main.py
+
 import os, json, time, urllib.parse, random
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client
 
-# --- INIT ---
+# --------------------
+# INIT
+# --------------------
 app = FastAPI()
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
@@ -20,18 +24,26 @@ else:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # for production you might want to restrict this
+    allow_origins=["*"],   # OK for prototype. Lock down later.
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
 )
 
-# ---------- UTILS ----------
+# --------------------
+# UTILS
+# --------------------
+def _require_supabase():
+    if supabase is None:
+        raise RuntimeError("SUPABASE_NOT_CONFIGURED")
+
+def _now() -> int:
+    return int(time.time())
+
 def validate_auth(init_data: str) -> Dict[str, Any]:
     """
-    DEV MODE ONLY:
-    - In production, you should validate Telegram initData signature.
-    - For now, this parses Telegram's `user` JSON if present, else debug user.
+    DEV MODE ONLY: This does NOT verify Telegram initData signatures.
+    Production should verify initData hash.
     """
     if init_data == "debug_mode":
         return {"id": 12345, "username": "Architect"}
@@ -40,69 +52,55 @@ def validate_auth(init_data: str) -> Dict[str, Any]:
         parsed = dict(x.split("=", 1) for x in init_data.split("&"))
         user_json = urllib.parse.unquote(parsed.get("user", "{}"))
         u = json.loads(user_json) if user_json else {}
-        # Telegram uses `id` and `username` / `first_name`
         uid = u.get("id") or 12345
         uname = u.get("username") or u.get("first_name") or "Citizen"
-        return {"id": uid, "username": uname}
+        return {"id": int(uid), "username": uname}
     except Exception:
         return {"id": 12345, "username": "Debug_User"}
 
-
-def _require_supabase():
-    if supabase is None:
-        raise RuntimeError("SUPABASE_NOT_CONFIGURED")
-
-
-def _now() -> int:
-    return int(time.time())
-
-
-def _loot_table() -> List[str]:
-    # Keep item ids simple strings for your UI
+def _loot_table():
     return [
         "NEON_RING", "GLITCH_MASK", "VOID_CAPE",
         "BLOOD_VIAL", "SPARK_CORE", "ECHO_CHIP",
         "SIGIL_BLADE", "PHANTOM_LENS", "RUNE_BATTERY"
     ]
 
+def _safe_int(x, default=0) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
 
-def _grant_loot(uid: int, item_id: str, qty: int = 1) -> None:
-    """
-    Upsert into inventory: (user_id, item_id) with qty accumulation.
-    Requires unique constraint on (user_id, item_id) OR manual merge.
-    We'll do manual merge for compatibility.
-    """
+def _get_user_by_tg_id(tg_id: int) -> Optional[Dict[str, Any]]:
     _require_supabase()
-
-    # read existing qty
-    existing = supabase.table("inventory").select("qty").eq("user_id", uid).eq("item_id", item_id).execute()
-    if existing.data and len(existing.data) > 0:
-        new_qty = int(existing.data[0].get("qty") or 0) + qty
-        supabase.table("inventory").update({"qty": new_qty}).eq("user_id", uid).eq("item_id", item_id).execute()
-    else:
-        supabase.table("inventory").insert({"user_id": uid, "item_id": item_id, "qty": qty}).execute()
-
-
-def _get_user(uid: int) -> Optional[Dict[str, Any]]:
-    _require_supabase()
-    res = supabase.table("users").select("*").eq("user_id", uid).execute()
+    res = supabase.table("users").select("*").eq("tg_id", tg_id).limit(1).execute()
     if res.data:
         return res.data[0]
     return None
 
-
-def _ensure_user(uid: int, username: str) -> Dict[str, Any]:
+def _ensure_user(tg_id: int, username: str) -> Dict[str, Any]:
+    """
+    Uses users.tg_id (bigint unique) as the app identity key.
+    Keeps any UUID primary key your table already has.
+    """
     _require_supabase()
-    u = _get_user(uid)
+    u = _get_user_by_tg_id(tg_id)
     if u:
-        # optionally update username if changed
+        # keep username fresh
         if username and u.get("username") != username:
-            supabase.table("users").update({"username": username}).eq("user_id", uid).execute()
+            supabase.table("users").update({"username": username}).eq("tg_id", tg_id).execute()
             u["username"] = username
+        # fill defaults if missing
+        patch = {}
+        if u.get("ap") is None: patch["ap"] = 0
+        if u.get("faction") is None: patch["faction"] = "UNSORTED"
+        if patch:
+            supabase.table("users").update(patch).eq("tg_id", tg_id).execute()
+            u.update(patch)
         return u
 
     new_user = {
-        "user_id": uid,
+        "tg_id": tg_id,
         "username": username or "Citizen",
         "ap": 0,
         "faction": "UNSORTED",
@@ -112,37 +110,53 @@ def _ensure_user(uid: int, username: str) -> Dict[str, Any]:
     supabase.table("users").insert(new_user).execute()
     return new_user
 
+def _grant_loot(tg_id: int, item_id: str, qty: int = 1) -> None:
+    """
+    inventory table expected:
+      tg_id bigint, item_id text, qty int, unique(tg_id,item_id)
+    """
+    _require_supabase()
+    ex = supabase.table("inventory").select("qty").eq("tg_id", tg_id).eq("item_id", item_id).limit(1).execute()
+    if ex.data:
+        new_qty = _safe_int(ex.data[0].get("qty"), 0) + qty
+        supabase.table("inventory").update({"qty": new_qty}).eq("tg_id", tg_id).eq("item_id", item_id).execute()
+    else:
+        supabase.table("inventory").insert({"tg_id": tg_id, "item_id": item_id, "qty": qty}).execute()
 
-# ---------- HEALTH ----------
+
+# --------------------
+# HEALTH
+# --------------------
 @app.get("/")
 def health_check():
-    return {"status": "TITANIUM ONLINE", "ts": _now()}
+    return {"status": "TITANIUM 13.2 ONLINE", "ts": _now()}
 
 
-# ---------- AUTH ----------
+# --------------------
+# AUTH
+# --------------------
 @app.post("/auth/login")
 async def login(req: dict):
     try:
         _require_supabase()
-        u_data = validate_auth(req.get("initData"))
-        uid = int(u_data["id"])
+        u_data = validate_auth(req.get("initData") or "")
+        tg_id = int(u_data["id"])
         username = u_data.get("username", "Citizen")
-
-        u = _ensure_user(uid, username)
+        u = _ensure_user(tg_id, username)
         return {"status": "ok", "user": u}
     except Exception as e:
         return {"status": "error", "msg": str(e)}
-
 
 @app.post("/auth/biolock")
 async def upload_biolock(initData: str = Form(...), file: UploadFile = File(...)):
     try:
         _require_supabase()
         u_data = validate_auth(initData)
-        uid = int(u_data["id"])
+        tg_id = int(u_data["id"])
+        _ensure_user(tg_id, u_data.get("username", "Citizen"))
 
         content = await file.read()
-        filename = f"{uid}_{_now()}.jpg"
+        filename = f"{tg_id}_{_now()}.jpg"
 
         try:
             supabase.storage.from_("bio-locks").upload(filename, content, {"content-type": "image/jpeg"})
@@ -151,30 +165,34 @@ async def upload_biolock(initData: str = Form(...), file: UploadFile = File(...)
             print(f"STORAGE ERROR: {e}")
             return {"status": "error", "msg": "BUCKET_FAIL"}
 
-        supabase.table("users").update({"bio_lock_url": url}).eq("user_id", uid).execute()
+        supabase.table("users").update({"bio_lock_url": url}).eq("tg_id", tg_id).execute()
         return {"status": "success", "url": url}
 
     except Exception as e:
         print(f"UPLOAD ERROR: {e}")
         return {"status": "error", "msg": str(e)}
 
-
 @app.post("/auth/reset")
 async def reset_user(req: dict):
     try:
         _require_supabase()
-        u_data = validate_auth(req.get("initData"))
-        uid = int(u_data["id"])
+        u_data = validate_auth(req.get("initData") or "")
+        tg_id = int(u_data["id"])
 
-        supabase.table("users").update({"bio_lock_url": None, "equipped_item": None}).eq("user_id", uid).execute()
-        # optionally wipe inventory too:
-        # supabase.table("inventory").delete().eq("user_id", uid).execute()
+        # wipe biometric + equipped
+        supabase.table("users").update({"bio_lock_url": None, "equipped_item": None}).eq("tg_id", tg_id).execute()
+
+        # optional: wipe inventory too (commented)
+        # supabase.table("inventory").delete().eq("tg_id", tg_id).execute()
+
         return {"status": "RESET_COMPLETE"}
     except Exception as e:
         return {"status": "error", "msg": str(e)}
 
 
-# ---------- GAME: FEED ----------
+# --------------------
+# GAME: FEED
+# --------------------
 @app.post("/game/feed")
 async def game_feed(req: dict):
     """
@@ -182,210 +200,210 @@ async def game_feed(req: dict):
     """
     try:
         _require_supabase()
-        u_data = validate_auth(req.get("initData"))
-        uid = int(u_data["id"])
-        _ensure_user(uid, u_data.get("username", "Citizen"))
+        u_data = validate_auth(req.get("initData") or "")
+        tg_id = int(u_data["id"])
+        _ensure_user(tg_id, u_data.get("username", "Citizen"))
 
-        # get users with bio_lock_url not null and not self
         res = (
             supabase.table("users")
-            .select("user_id,username,bio_lock_url,faction,equipped_item")
-            .neq("user_id", uid)
+            .select("tg_id,username,bio_lock_url,faction,equipped_item")
+            .neq("tg_id", tg_id)
             .not_.is_("bio_lock_url", "null")
             .limit(25)
             .execute()
         )
 
-        return {"status": "ok", "feed": res.data or []}
+        # Frontend expects user_id; we can alias in payload for compatibility:
+        feed = []
+        for row in (res.data or []):
+            feed.append({
+                "user_id": row.get("tg_id"),
+                "tg_id": row.get("tg_id"),
+                "username": row.get("username"),
+                "bio_lock_url": row.get("bio_lock_url"),
+                "faction": row.get("faction"),
+                "equipped_item": row.get("equipped_item"),
+            })
+
+        return {"status": "ok", "feed": feed}
     except Exception as e:
         return {"status": "error", "msg": str(e), "feed": []}
 
 
-# ---------- GAME: SWIPE ----------
+# --------------------
+# GAME: SWIPE
+# --------------------
 @app.post("/game/swipe")
 async def game_swipe(req: dict):
     """
-    Records swipe, increments AP, and sometimes drops loot.
+    Records swipe, increments AP, sometimes drops loot.
     Expects: target_id, direction in {"LIGHT","SPITE"}.
-    Returns: new_ap, optional loot_drop.
     """
     try:
         _require_supabase()
-        u_data = validate_auth(req.get("initData"))
-        uid = int(u_data["id"])
-        user = _ensure_user(uid, u_data.get("username", "Citizen"))
+        u_data = validate_auth(req.get("initData") or "")
+        tg_id = int(u_data["id"])
+        user = _ensure_user(tg_id, u_data.get("username", "Citizen"))
 
-        target_id = int(req.get("target_id") or 0)
+        target_id = _safe_int(req.get("target_id"), 0)
         direction = (req.get("direction") or "").upper().strip()
         if direction not in ("LIGHT", "SPITE"):
             return {"status": "error", "msg": "BAD_DIRECTION"}
 
-        # record swipe (optional table)
+        # Optional swipes table: ignore if missing
         try:
             supabase.table("swipes").insert({
-                "user_id": uid,
-                "target_id": target_id,
+                "tg_id": tg_id,
+                "target_tg_id": target_id,
                 "direction": direction,
                 "ts": _now()
             }).execute()
         except Exception:
-            # If swipes table doesn't exist yet, ignore (frontend still works)
             pass
 
         # AP gain
-        new_ap = int(user.get("ap") or 0) + 1
-        supabase.table("users").update({"ap": new_ap}).eq("user_id", uid).execute()
+        new_ap = _safe_int(user.get("ap"), 0) + 1
+        supabase.table("users").update({"ap": new_ap}).eq("tg_id", tg_id).execute()
 
-        # loot drop chance: 15% on LIGHT, 5% on SPITE
+        # loot drop chance
         loot_drop = None
         roll = random.random()
         threshold = 0.15 if direction == "LIGHT" else 0.05
         if roll < threshold:
             loot_drop = random.choice(_loot_table())
-            _grant_loot(uid, loot_drop, qty=1)
+            # Optional inventory table: if missing, ignore
+            try:
+                _grant_loot(tg_id, loot_drop, qty=1)
+            except Exception:
+                loot_drop = None
 
         return {"status": "ok", "new_ap": new_ap, "loot_drop": loot_drop}
     except Exception as e:
         return {"status": "error", "msg": str(e)}
 
 
-# ---------- GAME: INVENTORY ----------
+# --------------------
+# GAME: INVENTORY
+# --------------------
 @app.post("/game/inventory")
 async def game_inventory(req: dict):
-    """
-    Returns items for the requesting user.
-    """
     try:
         _require_supabase()
-        u_data = validate_auth(req.get("initData"))
-        uid = int(u_data["id"])
-        _ensure_user(uid, u_data.get("username", "Citizen"))
+        u_data = validate_auth(req.get("initData") or "")
+        tg_id = int(u_data["id"])
+        _ensure_user(tg_id, u_data.get("username", "Citizen"))
 
-        res = supabase.table("inventory").select("item_id,qty").eq("user_id", uid).execute()
+        res = supabase.table("inventory").select("item_id,qty").eq("tg_id", tg_id).execute()
         items = res.data or []
-        # normalize
         for it in items:
-            it["qty"] = int(it.get("qty") or 0)
+            it["qty"] = _safe_int(it.get("qty"), 0)
         return {"status": "ok", "items": items}
     except Exception as e:
+        # If inventory table doesn't exist yet, return empty instead of failing hard
         return {"status": "error", "msg": str(e), "items": []}
 
 
-# ---------- GAME: EQUIP ----------
+# --------------------
+# GAME: EQUIP
+# --------------------
 @app.post("/game/equip")
 async def game_equip(req: dict):
-    """
-    Equips an item by setting users.equipped_item.
-    Expects: item_id
-    """
     try:
         _require_supabase()
-        u_data = validate_auth(req.get("initData"))
-        uid = int(u_data["id"])
-        _ensure_user(uid, u_data.get("username", "Citizen"))
+        u_data = validate_auth(req.get("initData") or "")
+        tg_id = int(u_data["id"])
+        _ensure_user(tg_id, u_data.get("username", "Citizen"))
 
         item_id = (req.get("item_id") or "").strip()
         if not item_id:
             return {"status": "error", "msg": "NO_ITEM_ID"}
 
-        # verify user owns it
-        inv = supabase.table("inventory").select("qty").eq("user_id", uid).eq("item_id", item_id).execute()
-        if not inv.data or int(inv.data[0].get("qty") or 0) <= 0:
+        # Verify owned (if inventory exists)
+        inv = supabase.table("inventory").select("qty").eq("tg_id", tg_id).eq("item_id", item_id).limit(1).execute()
+        if not inv.data or _safe_int(inv.data[0].get("qty"), 0) <= 0:
             return {"status": "error", "msg": "NOT_OWNED"}
 
-        supabase.table("users").update({"equipped_item": item_id}).eq("user_id", uid).execute()
+        supabase.table("users").update({"equipped_item": item_id}).eq("tg_id", tg_id).execute()
         return {"status": "ok", "equipped_item": item_id}
     except Exception as e:
         return {"status": "error", "msg": str(e)}
 
 
-# ---------- GAME: COMBAT ----------
+# --------------------
+# GAME: COMBAT
+# --------------------
 @app.post("/game/combat/info")
 async def combat_info(req: dict):
     """
-    Returns a boss "instance" (simple). Frontend keeps boss_hp_current, and
-    sends it back to /turn.
-
-    You can later expand to persistent combat sessions, boss types, etc.
+    Returns boss info. Frontend holds HP state and sends it to /turn.
     """
     try:
         _require_supabase()
-        u_data = validate_auth(req.get("initData"))
-        uid = int(u_data["id"])
-        user = _ensure_user(uid, u_data.get("username", "Citizen"))
+        u_data = validate_auth(req.get("initData") or "")
+        tg_id = int(u_data["id"])
+        user = _ensure_user(tg_id, u_data.get("username", "Citizen"))
 
-        ap = int(user.get("ap") or 0)
-        # scale HP with AP, but keep it playable
-        base = 25 + min(ap // 5, 25)  # up to +25
-        boss = {
-            "name": "AMBUSH DEMON",
-            "hp": base,
-            "max_hp": base,
-            "lvl": 1 + min(ap // 10, 20)
-        }
+        ap = _safe_int(user.get("ap"), 0)
+        base_hp = 25 + min(ap // 5, 25)  # scales up to +25
+        boss = {"name": "AMBUSH DEMON", "hp": base_hp, "max_hp": base_hp, "lvl": 1 + min(ap // 10, 20)}
         return {"status": "ok", "boss": boss}
     except Exception as e:
-        return {"status": "error", "msg": str(e), "boss": {"name":"AMBUSH DEMON","hp":25,"max_hp":25,"lvl":1}}
+        return {"status": "error", "msg": str(e), "boss": {"name": "AMBUSH DEMON", "hp": 25, "max_hp": 25, "lvl": 1}}
 
 
 @app.post("/game/combat/turn")
 async def combat_turn(req: dict):
     """
     Expects:
-      - action: "ATTACK" or "POTION_HP"
-      - boss_hp_current: number
+      action: ATTACK | POTION_HP
+      boss_hp_current: int
     Returns:
-      - new_boss_hp
-      - status: "ONGOING" or "VICTORY"
-      - loot (on victory)
+      new_boss_hp, status, loot?, new_ap?
     """
     try:
         _require_supabase()
-        u_data = validate_auth(req.get("initData"))
-        uid = int(u_data["id"])
-        user = _ensure_user(uid, u_data.get("username", "Citizen"))
+        u_data = validate_auth(req.get("initData") or "")
+        tg_id = int(u_data["id"])
+        user = _ensure_user(tg_id, u_data.get("username", "Citizen"))
 
         action = (req.get("action") or "").upper().strip()
-        boss_hp_current = req.get("boss_hp_current")
-        if boss_hp_current is None:
-            return {"status": "error", "msg": "MISSING_BOSS_HP"}
-
-        try:
-            boss_hp = int(boss_hp_current)
-        except Exception:
+        boss_hp = _safe_int(req.get("boss_hp_current"), -1)
+        if boss_hp < 0:
             return {"status": "error", "msg": "BAD_BOSS_HP"}
 
         boss_hp = max(0, boss_hp)
 
         if action == "ATTACK":
-            # damage scales a bit with AP
-            ap = int(user.get("ap") or 0)
-            dmg = 3 + random.randint(0, 4) + min(ap // 20, 5)  # small scaling
+            ap = _safe_int(user.get("ap"), 0)
+            dmg = 3 + random.randint(0, 4) + min(ap // 20, 5)
             new_hp = max(0, boss_hp - dmg)
 
             if new_hp == 0:
                 loot = random.choice(_loot_table())
-                _grant_loot(uid, loot, qty=1)
+                try:
+                    _grant_loot(tg_id, loot, qty=1)
+                except Exception:
+                    loot = None
 
-                # reward AP too
-                new_ap = int(user.get("ap") or 0) + 2
-                supabase.table("users").update({"ap": new_ap}).eq("user_id", uid).execute()
+                # reward AP for victory
+                new_ap = ap + 2
+                supabase.table("users").update({"ap": new_ap}).eq("tg_id", tg_id).execute()
 
                 return {"status": "VICTORY", "new_boss_hp": 0, "loot": loot, "new_ap": new_ap}
 
             return {"status": "ONGOING", "new_boss_hp": new_hp}
 
-        elif action == "POTION_HP":
-            # simple heal effect: costs 1 AP if available, no boss change
-            ap = int(user.get("ap") or 0)
+        if action == "POTION_HP":
+            # prototype: potion costs 1 AP, no boss change
+            ap = _safe_int(user.get("ap"), 0)
             if ap <= 0:
                 return {"status": "ONGOING", "new_boss_hp": boss_hp, "msg": "NO_AP"}
+
             new_ap = ap - 1
-            supabase.table("users").update({"ap": new_ap}).eq("user_id", uid).execute()
+            supabase.table("users").update({"ap": new_ap}).eq("tg_id", tg_id).execute()
             return {"status": "ONGOING", "new_boss_hp": boss_hp, "new_ap": new_ap}
 
-        else:
-            return {"status": "error", "msg": "BAD_ACTION"}
+        return {"status": "error", "msg": "BAD_ACTION"}
 
     except Exception as e:
         return {"status": "error", "msg": str(e)}
