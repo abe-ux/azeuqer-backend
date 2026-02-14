@@ -1,13 +1,23 @@
-# AZEUQER TITANIUM - PROMPT 1: GENESIS & SCHEMA (FULL FILE)
-# Includes: Auth + Referral + Pioneer + BioLock payout trigger
-# Compatible with: users.user_id NOT NULL
+# AZEUQER TITANIUM — PROMPT 1 (FULL BACKEND)
+# Includes:
+# - /auth/login (referral capture + pioneer + verification)
+# - /auth/biolock (stores bio_lock_url + triggers referral payout)
+# - /auth/reset
+# - /profile/vessel (stores body_asset_id)  ✅ FIXES YOUR MESSAGE
+#
+# Requirements:
+# - users.user_id NOT NULL (your current schema)
+# - users has columns added from Prompt 1 SQL (tg_id, role, verification_status, referral_status, body_asset_id, etc.)
+# - game_config table exists (key,value)
+# - optional referral_ledger table (recommended)
 
-import os, json, time, urllib.parse
+import os, json, time, urllib.parse, re
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client
+
 
 # --------------------
 # INIT
@@ -25,11 +35,12 @@ else:
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # prototype ok
+    allow_origins=["*"],  # prototype ok; lock down later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 # --------------------
 # UTILS
@@ -82,7 +93,7 @@ def _parse_referral(start_param: str) -> Optional[int]:
 
 def _get_config_int(key: str, default: int) -> int:
     """
-    Uses public.game_config (NOT system_config).
+    Uses public.game_config (key,value).
     """
     try:
         res = supabase.table("game_config").select("value").eq("key", key).limit(1).execute()
@@ -104,7 +115,6 @@ def _count_users_exact() -> int:
         res = supabase.table("users").select("user_id", count="exact").limit(1).execute()
         return int(res.count or 0)
     except Exception:
-        # fallback (less ideal)
         res = supabase.table("users").select("user_id").execute()
         return len(res.data or [])
 
@@ -156,18 +166,16 @@ def _ensure_user(user_id: int, username: str, referred_by: Optional[int]) -> Dic
         "energy_updated_at": "now()",
 
         "body_asset_id": None,
+        "referral_status": "NONE",
     }
 
-    # referral only if valid and not self
     if referred_by and referred_by != user_id:
         new_row["referred_by"] = int(referred_by)
         new_row["referral_status"] = "PENDING"
-    else:
-        new_row["referral_status"] = "NONE"
 
     supabase.table("users").insert(new_row).execute()
 
-    # create referral ledger if needed
+    # create referral ledger if table exists
     if new_row.get("referred_by"):
         bonus = _get_config_int("referral_bonus_ap", 100)
         try:
@@ -193,7 +201,7 @@ def _award_ap(user_id: int, amount: int) -> int:
 def _trigger_referral_payout(invitee_user_id: int) -> Dict[str, Any]:
     """
     Pays inviter + invitee only when invitee has bio_lock_url.
-    Prevents double pay via referral_ledger.
+    Prevents double pay via referral_ledger when available.
     """
     invitee = _get_user(invitee_user_id)
     if not invitee:
@@ -210,7 +218,6 @@ def _trigger_referral_payout(invitee_user_id: int) -> Dict[str, Any]:
     bonus = _get_config_int("referral_bonus_ap", 100)
 
     # ledger check
-    led = None
     try:
         led = (
             supabase.table("referral_ledger")
@@ -223,12 +230,13 @@ def _trigger_referral_payout(invitee_user_id: int) -> Dict[str, Any]:
         if led.data and led.data[0].get("status") == "PAID":
             return {"status": "noop", "msg": "ALREADY_PAID"}
     except Exception:
-        pass
+        led = None
 
     inviter_ap = _award_ap(inviter_id, bonus)
     invitee_ap = _award_ap(invitee_user_id, bonus)
 
     supabase.table("users").update({"referral_status": "PAID"}).eq("user_id", invitee_user_id).execute()
+
     try:
         supabase.table("referral_ledger").update({"status": "PAID", "paid_at": "now()"}).eq("inviter_user_id", inviter_id).eq("invitee_user_id", invitee_user_id).execute()
     except Exception:
@@ -243,20 +251,36 @@ def _trigger_referral_payout(invitee_user_id: int) -> Dict[str, Any]:
         "invitee_ap": invitee_ap
     }
 
+def _sanitize_body_asset_id(asset: str) -> Optional[str]:
+    """
+    Allow only safe filenames like: body_low_mid_high_low.png
+    Prevents path traversal and weird injection.
+    """
+    if not asset:
+        return None
+    asset = asset.strip()
+    if len(asset) > 80:
+        return None
+    # strict pattern
+    if re.fullmatch(r"body_(low|mid|high)_(low|mid|high)_(low|mid|high)_(low|mid|high)\.png", asset):
+        return asset
+    return None
+
+
 # --------------------
 # ENDPOINTS
 # --------------------
 @app.get("/")
 def health_check():
-    return {"status": "TITANIUM ONLINE", "ts": int(time.time())}
+    return {"status": "AZEUQER TITANIUM ONLINE", "ts": int(time.time())}
 
 @app.post("/auth/login")
 async def login(req: dict):
     """
-    PROMPT 1:
-    - capture referral
+    Prompt 1:
+    - capture referral from Telegram start_param OR req.ref
     - pioneer assignment + verification status
-    - last_active update
+    - updates last_active
     """
     try:
         _require_supabase()
@@ -286,9 +310,9 @@ async def login(req: dict):
 @app.post("/auth/biolock")
 async def upload_biolock(initData: str = Form(...), file: UploadFile = File(...)):
     """
-    PROMPT 1:
-    - store bio_lock_url
-    - trigger referral payout if pending
+    Prompt 1:
+    - stores bio_lock_url
+    - triggers referral payout if pending
     """
     try:
         _require_supabase()
@@ -311,7 +335,11 @@ async def upload_biolock(initData: str = Form(...), file: UploadFile = File(...)
 
         payout = _trigger_referral_payout(user_id)
 
-        return {"status": "success", "url": url, "referral": payout}
+        u = _get_user(user_id) or {}
+        u["user_id"] = user_id
+        u["tg_id"] = u.get("tg_id") or user_id
+
+        return {"status": "success", "url": url, "referral": payout, "user": u}
     except Exception as e:
         return {"status": "error", "msg": str(e)}
 
@@ -332,12 +360,44 @@ async def reset_user(req: dict):
             "referral_status": "BROKEN"
         }).eq("user_id", user_id).execute()
 
-        # optional: also break ledger if exists
         try:
             supabase.table("referral_ledger").update({"status": "BROKEN"}).eq("invitee_user_id", user_id).execute()
         except Exception:
             pass
 
         return {"status": "RESET_COMPLETE"}
+    except Exception as e:
+        return {"status": "error", "msg": str(e)}
+
+@app.post("/profile/vessel")
+async def profile_vessel(req: dict):
+    """
+    ✅ FIX: This endpoint is required by Prompt 1 HTML.
+    Saves body_asset_id to users.body_asset_id.
+    """
+    try:
+        _require_supabase()
+
+        init_data = req.get("initData") or ""
+        u_data = validate_auth(init_data)
+        user_id = int(u_data["id"])
+
+        # Ensure user exists
+        _ensure_user(user_id, u_data.get("username", "Citizen"), referred_by=None)
+
+        body_asset_id = _sanitize_body_asset_id(req.get("body_asset_id") or "")
+        if not body_asset_id:
+            return {"status": "error", "msg": "BAD_BODY_ASSET_ID"}
+
+        supabase.table("users").update({
+            "body_asset_id": body_asset_id,
+            "last_active": "now()"
+        }).eq("user_id", user_id).execute()
+
+        u = _get_user(user_id) or {}
+        u["user_id"] = user_id
+        u["tg_id"] = u.get("tg_id") or user_id
+
+        return {"status": "ok", "user": u}
     except Exception as e:
         return {"status": "error", "msg": str(e)}
