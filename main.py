@@ -1,891 +1,212 @@
-# AZEUQER TITANIUM — SCHEMA-TOLERANT BACKEND (SUPABASE SAFE MODE)
-# - Works even if your Supabase tables are missing columns (auto-strips unknown keys)
-# - Restores swipes, boss triggers every 10th swipe, top images, vessel endpoint
-# - Fake feed + boss SVG assets served from Render
-#
-# Copy-paste as main.py
-
-import os, json, time, urllib.parse, random, re
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Optional, List, Tuple
+# AZEUQER TITANIUM - main.py (Render)
+import os, json, time, urllib.parse, re
+from typing import Optional
 
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from pydantic import BaseModel
 from supabase import create_client
 
+# --- INIT ---
 app = FastAPI()
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 supabase = None
-if SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+if not SUPABASE_URL or not SUPABASE_KEY:
+    print("CRITICAL: SUPABASE KEYS MISSING")
 else:
-    print("WARNING: SUPABASE keys missing. Running DEV MEMORY MODE (no persistence).")
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],   # tighten later
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
 
-UTC = timezone.utc
+# --- MODELS ---
+class LoginReq(BaseModel):
+    initData: str
+    referralCode: Optional[str] = None
 
-# =========================
-# GAME RULES
-# =========================
-FOUNDERS_LIMIT = 23
-ENERGY_MAX = 30
-ENERGY_REGEN_SECONDS = 180           # 1 energy / 3 minutes (lazy)
-FREE_SWIPES_PER_DAY = 20
-ENERGY_COST_AFTER_FREE = 1
-AMBUSH_EVERY_N_SWIPES = 10
+class EmailReq(BaseModel):
+    initData: str
+    email: str
 
-FEED_ACTIVE_WINDOW_SECONDS = 300
-FEED_FALLBACK_WINDOW_SECONDS = 3600
-FEED_LIMIT = 20
+class ResetReq(BaseModel):
+    initData: str
 
-FAKE_TARGET_COUNT = 25
-FAKE_USER_ID_BASE = 900_000
-FAKE_BOSS_COUNT = 12
+# --- UTILS ---
+def require_supabase():
+    if supabase is None:
+        return False
+    return True
 
-# =========================
-# DEV MEMORY MODE
-# =========================
-DEV_USERS: Dict[int, Dict[str, Any]] = {}
-DEV_SWIPES: List[Dict[str, Any]] = []
-DEV_INVENTORY: Dict[int, List[Dict[str, Any]]] = {}
-
-# =========================
-# TIME HELPERS
-# =========================
-def now_utc() -> datetime:
-    return datetime.now(tz=UTC)
-
-def iso(dt: datetime) -> str:
-    return dt.astimezone(UTC).isoformat()
-
-def parse_iso(s: Optional[str]) -> Optional[datetime]:
-    if not s:
-        return None
-    try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-def day_key_utc(dt: Optional[datetime] = None) -> str:
-    dt = dt or now_utc()
-    return dt.strftime("%Y-%m-%d")
-
-def safe_int(v, default=0) -> int:
-    try:
-        return int(v)
-    except Exception:
-        return default
-
-def is_fake_user_id(uid: int) -> bool:
-    return uid >= FAKE_USER_ID_BASE and uid < FAKE_USER_ID_BASE + 100_000
-
-# =========================
-# AUTH PARSE
-# =========================
-def validate_auth(init_data: str) -> Dict[str, Any]:
+def validate_auth(init_data: str):
+    # DEBUG MODE
     if init_data == "debug_mode":
         return {"id": 12345, "username": "Architect"}
+
+    # Telegram initData contains urlencoded pairs, including user JSON
     try:
         parsed = dict(x.split("=", 1) for x in init_data.split("&"))
         user_json = urllib.parse.unquote(parsed.get("user", "{}"))
         return json.loads(user_json)
-    except Exception:
+    except:
         return {"id": 12345, "username": "Debug_User"}
 
-# =========================
-# NORMALIZE USER (soft defaults)
-# NOTE: These keys might NOT exist in Supabase; we will strip unknown keys on write.
-# =========================
-def normalize_user_state(user: Dict[str, Any]) -> Dict[str, Any]:
-    # allow either user_id or tg_id; your table uses user_id
-    user.setdefault("user_id", user.get("tg_id") or user.get("id") or 0)
-    user.setdefault("username", "Citizen")
-    user.setdefault("email", None)
+def is_valid_email(email: str) -> bool:
+    if not email:
+        return False
+    email = email.strip()
+    # basic but safe validation
+    return bool(re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]{2,}$", email, re.IGNORECASE))
 
-    user.setdefault("role", "CITIZEN")
-    user.setdefault("is_founder", False)
-
-    user.setdefault("verification_status", "VERIFIED")
-    user.setdefault("biolock_status", "GATE")
-    user.setdefault("bio_lock_url", None)
-
-    user.setdefault("vessel_work", 0)
-    user.setdefault("vessel_pace", 0)
-    user.setdefault("vessel_mind", 0)
-    user.setdefault("vessel_vibe", 0)
-    user.setdefault("body_asset_id", "body_dev")
-
-    user.setdefault("faction", "UNSORTED")
-    user.setdefault("faction_assigned", False)
-    user.setdefault("init_light", 0)
-    user.setdefault("init_spite", 0)
-
-    user.setdefault("votes_light", 0)
-    user.setdefault("votes_spite", 0)
-
-    user.setdefault("ap", 0)
-    user.setdefault("visibility_credits", 10)
-
-    user.setdefault("energy", ENERGY_MAX)
-    user.setdefault("energy_updated_at", iso(now_utc()))
-
-    user.setdefault("swipes_day_key", day_key_utc())
-    user.setdefault("swipes_today", 0)
-
-    user.setdefault("last_active", iso(now_utc()))
-    return user
-
-def apply_daily_reset(user: Dict[str, Any]) -> Dict[str, Any]:
-    today = day_key_utc()
-    if (user.get("swipes_day_key") or today) != today:
-        user["swipes_day_key"] = today
-        user["swipes_today"] = 0
-        user["init_light"] = 0
-        user["init_spite"] = 0
-    return user
-
-def apply_energy_regen(user: Dict[str, Any]) -> Dict[str, Any]:
-    energy = safe_int(user.get("energy"), ENERGY_MAX)
-    updated_at = parse_iso(user.get("energy_updated_at")) or now_utc()
-
-    if energy >= ENERGY_MAX:
-        user["energy"] = ENERGY_MAX
-        user["energy_updated_at"] = iso(updated_at)
-        return user
-
-    elapsed = (now_utc() - updated_at).total_seconds()
-    if elapsed <= 0:
-        return user
-
-    gained = int(elapsed // ENERGY_REGEN_SECONDS)
-    if gained <= 0:
-        return user
-
-    new_energy = min(ENERGY_MAX, energy + gained)
-    new_updated_at = updated_at + timedelta(seconds=gained * ENERGY_REGEN_SECONDS)
-
-    user["energy"] = new_energy
-    user["energy_updated_at"] = iso(new_updated_at)
-    return user
-
-def assign_founder_flags_for_new_user(new_user: Dict[str, Any]) -> Dict[str, Any]:
-    new_user["is_founder"] = True
-    new_user["role"] = "FOUNDER"
-    new_user["verification_status"] = "VERIFIED"
-    new_user["biolock_status"] = "PASS"
-    if not new_user.get("bio_lock_url"):
-        seed = (safe_int(new_user.get("user_id")) % FAKE_TARGET_COUNT) + 1
-        new_user["bio_lock_url"] = f"/dev/fake_image/{seed}.svg"
-    return new_user
-
-# =========================
-# SUPABASE SAFE WRITE
-# Strips missing columns automatically based on PGRST204 error message.
-# =========================
-_missing_col_re = re.compile(r"Could not find the '([^']+)' column")
-
-def _extract_missing_column(msg: str) -> Optional[str]:
-    m = _missing_col_re.search(msg or "")
-    return m.group(1) if m else None
-
-def supa_safe_insert(table: str, row: Dict[str, Any], max_retries: int = 12):
-    if not supabase:
-        return None
-    payload = dict(row)
-    last_err = None
-    for _ in range(max_retries):
-        try:
-            return supabase.table(table).insert(payload).execute()
-        except Exception as e:
-            last_err = e
-            col = _extract_missing_column(str(e))
-            if col and col in payload:
-                payload.pop(col, None)
-                continue
-            raise
-    raise last_err
-
-def supa_safe_update(table: str, match_col: str, match_val: Any, updates: Dict[str, Any], max_retries: int = 12):
-    if not supabase:
-        return None
-    payload = dict(updates)
-    last_err = None
-    for _ in range(max_retries):
-        try:
-            return supabase.table(table).update(payload).eq(match_col, match_val).execute()
-        except Exception as e:
-            last_err = e
-            col = _extract_missing_column(str(e))
-            if col and col in payload:
-                payload.pop(col, None)
-                continue
-            raise
-    raise last_err
-
-def supa_get_user(uid: int) -> Optional[Dict[str, Any]]:
-    if not supabase:
-        return None
-    res = supabase.table("users").select("*").eq("user_id", uid).limit(1).execute()
-    if res.data:
-        return res.data[0]
-    return None
-
-def supa_count_users_best_effort() -> int:
-    # best effort count without relying on count feature
-    if not supabase:
-        return 0
-    try:
-        r = supabase.table("users").select("user_id", count="exact").limit(1).execute()
-        c = getattr(r, "count", None)
-        if c is not None:
-            return int(c)
-    except Exception:
-        pass
-    try:
-        r2 = supabase.table("users").select("user_id").limit(1000).execute()
-        return len(r2.data or [])
-    except Exception:
-        return 999999
-
-# =========================
-# SVG ASSETS (FAKE USERS + BOSSES)
-# =========================
-def make_svg(seed: int, label: str) -> str:
-    rnd = random.Random(seed)
-    bg1 = f"#{rnd.randrange(0x111111, 0xFFFFFF):06x}"
-    bg2 = f"#{rnd.randrange(0x111111, 0xFFFFFF):06x}"
-    neon = f"#{rnd.randrange(0x00FFFF, 0xFFFFFF):06x}"
-    eye = f"#{rnd.randrange(0x000000, 0x222222):06x}"
-    name = f"{label}-{seed:02d}"
-    glyph = rnd.choice(["∆","Ø","Ψ","Λ","Σ","⊕","⋈","⟁","⟡","⟢","⟣","⟐","⨳","⧫"])
-
-    return f"""<svg xmlns="http://www.w3.org/2000/svg" width="900" height="1200">
-<defs>
-  <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-    <stop offset="0%" stop-color="{bg1}"/>
-    <stop offset="100%" stop-color="{bg2}"/>
-  </linearGradient>
-</defs>
-<rect width="100%" height="100%" fill="url(#g)"/>
-<rect x="40" y="40" width="820" height="1120" rx="40" fill="rgba(0,0,0,0.25)" stroke="{neon}" stroke-opacity="0.35" stroke-width="6"/>
-<circle cx="450" cy="520" r="240" fill="rgba(0,0,0,0.28)" stroke="{neon}" stroke-opacity="0.55" stroke-width="6"/>
-<circle cx="360" cy="470" r="28" fill="{eye}"/><circle cx="540" cy="470" r="28" fill="{eye}"/>
-<rect x="420" y="530" width="60" height="16" rx="8" fill="{eye}" opacity="0.6"/>
-<path d="M340 600 C 390 680, 510 680, 560 600" stroke="{neon}" stroke-opacity="0.55" stroke-width="10" fill="none" stroke-linecap="round"/>
-<text x="70" y="110" fill="{neon}" font-size="44" font-family="monospace" opacity="0.92">{name}</text>
-<text x="70" y="1090" fill="{neon}" font-size="120" font-family="monospace" opacity="0.22">{glyph}</text>
-</svg>"""
-
-@app.get("/dev/fake_image/{seed}.svg")
-def dev_fake(seed: int):
-    return Response(content=make_svg(seed, "CITIZEN"), media_type="image/svg+xml")
-
-@app.get("/dev/boss/{boss_id}.svg")
-def dev_boss(boss_id: int):
-    seed = 1000 + (boss_id % 10_000)
-    return Response(content=make_svg(seed, "BOSS"), media_type="image/svg+xml")
-
-# =========================
-# HEALTH
-# =========================
+# --- ENDPOINTS ---
 @app.get("/")
-def health():
-    return {"status": "AZEUQER BACKEND ONLINE", "ts": iso(now_utc())}
+def health_check():
+    return {"status": "AZEUQER BACKEND ONLINE"}
 
-# =========================
-# VESSEL MANIFEST (fixes missing /profile/vessel)
-# =========================
-@app.get("/profile/vessel")
-def vessel_manifest():
-    return {
-        "status": "ok",
-        "sliders": [
-            {"key": "work", "label0": "LAZY", "label1": "DILIGENT"},
-            {"key": "pace", "label0": "SLOW", "label1": "FAST"},
-            {"key": "mind", "label0": "SMART", "label1": "TOUGH"},
-            {"key": "vibe", "label0": "NERD", "label1": "COOL"},
-        ],
-    }
-
-# =========================
-# AUTH LOGIN
-# =========================
 @app.post("/auth/login")
-async def login(req: dict):
-    init_data = req.get("initData") or "debug_mode"
-    u = validate_auth(init_data)
-    uid = safe_int(u.get("id"))
-    username = u.get("username", "Citizen")
+async def login(req: LoginReq):
+    if not require_supabase():
+        return {"status": "error", "msg": "SUPABASE_NOT_CONFIGURED"}
 
-    # DEV
-    if not supabase:
-        if uid not in DEV_USERS:
-            me = normalize_user_state({"user_id": uid, "username": username})
-            if len(DEV_USERS) < FOUNDERS_LIMIT:
-                me = assign_founder_flags_for_new_user(me)
-            DEV_USERS[uid] = me
-
-        me = normalize_user_state(DEV_USERS[uid])
-        me = apply_energy_regen(apply_daily_reset(me))
-        me["last_active"] = iso(now_utc())
-        DEV_USERS[uid] = me
-        return {"status": "ok", "user": me, "mode": "DEV_MEMORY"}
-
-    # SUPABASE
     try:
-        row = supa_get_user(uid)
-        if row:
-            me = normalize_user_state(row)
-        else:
-            me = normalize_user_state({"user_id": uid, "username": username})
-            count = supa_count_users_best_effort()
-            if count < FOUNDERS_LIMIT:
-                me = assign_founder_flags_for_new_user(me)
-            # SAFE insert (auto strips missing cols)
-            supa_safe_insert("users", me)
+        u_data = validate_auth(req.initData)
+        uid = int(u_data["id"])
+        uname = u_data.get("username") or "Citizen"
 
-        me = apply_energy_regen(apply_daily_reset(me))
-        me["last_active"] = iso(now_utc())
+        # Look up user
+        res = supabase.table("users").select("*").eq("user_id", uid).execute()
+        if res.data:
+            return {"status": "ok", "user": res.data[0]}
 
-        # safe update only
-        updates = {
-            "last_active": me["last_active"],
-            "energy": me.get("energy"),
-            "energy_updated_at": me.get("energy_updated_at"),
-            "swipes_today": me.get("swipes_today"),
-            "swipes_day_key": me.get("swipes_day_key"),
+        # Founder logic: first 23 get auto-accepted
+        # NOTE: If your schema uses different fields, adjust here.
+        count_res = supabase.table("users").select("user_id", count="exact").execute()
+        total_users = (count_res.count or 0)
+
+        role = "FOUNDER" if total_users < 23 else "CITIZEN"
+        status = "VERIFIED" if total_users < 23 else "PENDING"
+
+        # Referral parsing (optional)
+        referred_by = None
+        if req.referralCode and req.referralCode.startswith("ref_"):
+            try:
+                rid = int(req.referralCode.split("_")[1])
+                if rid != uid:
+                    referred_by = rid
+            except:
+                referred_by = None
+
+        new_user = {
+            "user_id": uid,
+            "username": uname,
+            "ap": 0,
+            "email": None,
+            "bio_lock_url": None,
+            "role": role,
+            "status": status,
+            "referred_by": referred_by
         }
-        supa_safe_update("users", "user_id", uid, updates)
 
-        # read back
-        row2 = supa_get_user(uid) or {}
-        return {"status": "ok", "user": normalize_user_state(row2)}
+        supabase.table("users").insert(new_user).execute()
+
+        # Re-fetch for consistency
+        res2 = supabase.table("users").select("*").eq("user_id", uid).execute()
+        return {"status": "created", "user": (res2.data[0] if res2.data else new_user)}
+
     except Exception as e:
         return {"status": "error", "msg": str(e)}
 
-# =========================
-# PROFILE UPDATE (username/email + vessel sliders)
-# =========================
-@app.post("/auth/profile")
-async def update_profile(req: dict):
-    init_data = req.get("initData") or "debug_mode"
-    u = validate_auth(init_data)
-    uid = safe_int(u.get("id"))
+@app.post("/profile/email")
+async def save_email(req: EmailReq):
+    """
+    Saves email for a user.
+    Awards +500 AP ONLY the first time email is set.
+    """
+    if not require_supabase():
+        return {"status": "error", "msg": "SUPABASE_NOT_CONFIGURED"}
 
-    nickname = (req.get("username") or "").strip()
-    email = (req.get("email") or "").strip().lower()
+    try:
+        u_data = validate_auth(req.initData)
+        uid = int(u_data["id"])
 
-    vessel_work = 1 if safe_int(req.get("vessel_work"), 0) else 0
-    vessel_pace = 1 if safe_int(req.get("vessel_pace"), 0) else 0
-    vessel_mind = 1 if safe_int(req.get("vessel_mind"), 0) else 0
-    vessel_vibe = 1 if safe_int(req.get("vessel_vibe"), 0) else 0
-
-    if nickname and (len(nickname) < 2 or len(nickname) > 20):
-        return {"status": "error", "msg": "BAD_USERNAME_LEN"}
-    if email:
-        if ("@" not in email) or ("." not in email) or len(email) < 6 or len(email) > 80:
+        email = (req.email or "").strip().lower()
+        if not is_valid_email(email):
             return {"status": "error", "msg": "INVALID_EMAIL"}
 
-    body_asset_id = f"body_{vessel_work}{vessel_pace}{vessel_mind}{vessel_vibe}"
+        # Fetch current user
+        res = supabase.table("users").select("*").eq("user_id", uid).execute()
+        if not res.data:
+            return {"status": "error", "msg": "USER_NOT_FOUND"}
 
-    # DEV
-    if not supabase:
-        me = DEV_USERS.get(uid) or normalize_user_state({"user_id": uid, "username": u.get("username","Citizen")})
-        if nickname:
-            me["username"] = nickname
-        if email:
-            me["email"] = email
-        me["vessel_work"] = vessel_work
-        me["vessel_pace"] = vessel_pace
-        me["vessel_mind"] = vessel_mind
-        me["vessel_vibe"] = vessel_vibe
-        me["body_asset_id"] = body_asset_id
-        me["last_active"] = iso(now_utc())
-        DEV_USERS[uid] = me
-        return {"status": "ok", "user": me, "mode": "DEV_MEMORY"}
+        user = res.data[0]
+        already_had_email = bool(user.get("email"))
 
-    # SUPABASE
-    try:
-        row = supa_get_user(uid)
-        if not row:
-            # auto create if missing
-            me = normalize_user_state({"user_id": uid, "username": u.get("username","Citizen")})
-            count = supa_count_users_best_effort()
-            if count < FOUNDERS_LIMIT:
-                me = assign_founder_flags_for_new_user(me)
-            supa_safe_insert("users", me)
+        updates = {"email": email}
+        # Award only once
+        if not already_had_email:
+            updates["ap"] = int(user.get("ap") or 0) + 500
 
-        updates = {
-            "last_active": iso(now_utc()),
-            "vessel_work": vessel_work,
-            "vessel_pace": vessel_pace,
-            "vessel_mind": vessel_mind,
-            "vessel_vibe": vessel_vibe,
-            "body_asset_id": body_asset_id,
-        }
-        if nickname:
-            updates["username"] = nickname
-        if email:
-            updates["email"] = email
+        supabase.table("users").update(updates).eq("user_id", uid).execute()
 
-        supa_safe_update("users", "user_id", uid, updates)
+        # Return updated user
+        res2 = supabase.table("users").select("*").eq("user_id", uid).execute()
+        return {"status": "ok", "user": (res2.data[0] if res2.data else {**user, **updates})}
 
-        row2 = supa_get_user(uid) or {}
-        return {"status": "ok", "user": normalize_user_state(row2)}
     except Exception as e:
         return {"status": "error", "msg": str(e)}
 
-# =========================
-# BIOLOCK UPLOAD
-# =========================
 @app.post("/auth/biolock")
 async def upload_biolock(initData: str = Form(...), file: UploadFile = File(...)):
-    u_data = validate_auth(initData)
-    uid = safe_int(u_data.get("id"))
-    content = await file.read()
+    """
+    Uploads selfie to Supabase Storage bucket "bio-locks" and stores public URL on user row.
+    """
+    if not require_supabase():
+        return {"status": "error", "msg": "SUPABASE_NOT_CONFIGURED"}
 
-    # DEV
-    if not supabase:
-        me = DEV_USERS.get(uid) or normalize_user_state({"user_id": uid, "username": u_data.get("username", "Citizen")})
-        me["biolock_status"] = "PASS"
-        me["bio_lock_url"] = f"/dev/fake_image/{(uid % FAKE_TARGET_COUNT) + 1}.svg"
-        me["last_active"] = iso(now_utc())
-        DEV_USERS[uid] = me
-        return {"status": "success", "url": me["bio_lock_url"], "mode": "DEV_MEMORY"}
-
-    # SUPABASE: store to bucket if exists; if not, just set fake URL
     try:
-        # If your bucket is configured, keep it:
-        filename = f"{uid}_{int(time.time())}.jpg"
-        try:
-            supabase.storage.from_("bio-locks").upload(filename, content, {"content-type": "image/jpeg"})
-            url = supabase.storage.from_("bio-locks").get_public_url(filename)
-        except Exception:
-            # fallback to dev SVG if bucket fails
-            url = f"/dev/fake_image/{(uid % FAKE_TARGET_COUNT) + 1}.svg"
+        u_data = validate_auth(initData)
+        uid = int(u_data["id"])
 
-        supa_safe_update("users", "user_id", uid, {
-            "bio_lock_url": url,
-            "biolock_status": "PASS",
-            "last_active": iso(now_utc()),
-        })
+        content = await file.read()
+        if not content or len(content) < 2000:
+            return {"status": "error", "msg": "FILE_TOO_SMALL"}
+
+        filename = f"{uid}_{int(time.time())}.jpg"
+
+        try:
+            supabase.storage.from_("bio-locks").upload(
+                filename,
+                content,
+                {"content-type": "image/jpeg"}
+            )
+            url = supabase.storage.from_("bio-locks").get_public_url(filename)
+        except Exception as e:
+            print(f"STORAGE ERROR: {e}")
+            return {"status": "error", "msg": "BUCKET_FAIL"}
+
+        supabase.table("users").update({"bio_lock_url": url}).eq("user_id", uid).execute()
         return {"status": "success", "url": url}
+
     except Exception as e:
+        print(f"UPLOAD ERROR: {e}")
         return {"status": "error", "msg": str(e)}
 
-# =========================
-# RESET
-# =========================
 @app.post("/auth/reset")
-async def reset_user(req: dict):
-    init_data = req.get("initData") or "debug_mode"
-    u = validate_auth(init_data)
-    uid = safe_int(u.get("id"))
+async def reset_user(req: ResetReq):
+    if not require_supabase():
+        return {"status": "error", "msg": "SUPABASE_NOT_CONFIGURED"}
 
-    # DEV
-    if not supabase:
-        me = DEV_USERS.get(uid)
-        if not me:
-            return {"status": "RESET_COMPLETE", "mode": "DEV_MEMORY"}
-        is_founder = bool(me.get("is_founder"))
-        role = me.get("role", "CITIZEN")
-        me2 = normalize_user_state({"user_id": uid, "username": me.get("username","Citizen")})
-        if is_founder:
-            me2 = assign_founder_flags_for_new_user(me2)
-            me2["role"] = role or "FOUNDER"
-        DEV_USERS[uid] = me2
-        return {"status": "RESET_COMPLETE", "mode": "DEV_MEMORY"}
-
-    # SUPABASE
     try:
-        row = supa_get_user(uid) or {}
-        is_founder = bool(row.get("is_founder"))
-        role = row.get("role") or ("FOUNDER" if is_founder else "CITIZEN")
-
-        updates = {
-            "bio_lock_url": None,
-            "biolock_status": "GATE",
-            "swipes_today": 0,
-            "swipes_day_key": day_key_utc(),
-            "last_active": iso(now_utc()),
-        }
-
-        # keep founders inside the gate bypass (as requested)
-        if is_founder:
-            updates["biolock_status"] = "PASS"
-            updates["role"] = role
-            updates["bio_lock_url"] = f"/dev/fake_image/{(uid % FAKE_TARGET_COUNT) + 1}.svg"
-
-        supa_safe_update("users", "user_id", uid, updates)
+        u_data = validate_auth(req.initData)
+        uid = int(u_data["id"])
+        supabase.table("users").update({"bio_lock_url": None}).eq("user_id", uid).execute()
         return {"status": "RESET_COMPLETE"}
     except Exception as e:
         return {"status": "error", "msg": str(e)}
-
-# =========================
-# TOP IMAGES (works even if users table lacks vote columns)
-# =========================
-@app.post("/game/top_images")
-async def top_images(req: dict):
-    bosses = [{"boss_id": i, "name": f"BOSS_{i:02d}", "image_url": f"/dev/boss/{i}.svg"} for i in range(1, 7)]
-
-    def fake_leaders():
-        fake = []
-        for i in range(1, FAKE_TARGET_COUNT + 1):
-            fake.append({
-                "user_id": FAKE_USER_ID_BASE + i,
-                "username": f"Citizen_{i:02d}",
-                "bio_lock_url": f"/dev/fake_image/{i}.svg",
-                "votes_light": random.randint(0, 80),
-                "votes_spite": random.randint(0, 80),
-            })
-        top_e = max(fake, key=lambda x: x["votes_light"])
-        top_d = max(fake, key=lambda x: x["votes_spite"])
-        return {"status": "ok", "top_euphoria": top_e, "top_dissonance": top_d, "bosses": bosses, "fake": True}
-
-    if not supabase:
-        return fake_leaders()
-
-    try:
-        # Try to query vote columns; if missing, this might still succeed but return nulls.
-        e = (supabase.table("users")
-             .select("user_id,username,bio_lock_url,votes_light,votes_spite")
-             .order("votes_light", desc=True)
-             .limit(1).execute())
-        d = (supabase.table("users")
-             .select("user_id,username,bio_lock_url,votes_light,votes_spite")
-             .order("votes_spite", desc=True)
-             .limit(1).execute())
-
-        if not e.data or not d.data:
-            return fake_leaders()
-
-        top_e = e.data[0]
-        top_d = d.data[0]
-        if not top_e.get("bio_lock_url"):
-            top_e["bio_lock_url"] = f"/dev/fake_image/{(safe_int(top_e.get('user_id')) % FAKE_TARGET_COUNT) + 1}.svg"
-        if not top_d.get("bio_lock_url"):
-            top_d["bio_lock_url"] = f"/dev/fake_image/{(safe_int(top_d.get('user_id')) % FAKE_TARGET_COUNT) + 1}.svg"
-
-        # If vote columns are missing / null, fill with 0
-        top_e["votes_light"] = safe_int(top_e.get("votes_light"), 0)
-        top_d["votes_spite"] = safe_int(top_d.get("votes_spite"), 0)
-
-        return {"status": "ok", "top_euphoria": top_e, "top_dissonance": top_d, "bosses": bosses, "fake": False}
-    except Exception:
-        return fake_leaders()
-
-# =========================
-# FEED (falls back to fake always if real rows not available)
-# =========================
-@app.post("/game/feed")
-async def feed(req: dict):
-    init_data = req.get("initData") or "debug_mode"
-    u = validate_auth(init_data)
-    uid = safe_int(u.get("id"))
-
-    def fake_feed():
-        fake = []
-        for i in range(1, FAKE_TARGET_COUNT + 1):
-            fake.append({
-                "user_id": FAKE_USER_ID_BASE + i,
-                "username": f"Citizen_{i:02d}",
-                "bio_lock_url": f"/dev/fake_image/{i}.svg",
-                "body_asset_id": "body_dev",
-            })
-        random.shuffle(fake)
-        return {"status": "ok", "feed": fake[:FEED_LIMIT], "fallback": True, "fake": True}
-
-    if not supabase:
-        return fake_feed()
-
-    try:
-        supa_safe_update("users", "user_id", uid, {"last_active": iso(now_utc())})
-    except Exception:
-        pass
-
-    try:
-        cutoff_5m = iso(now_utc() - timedelta(seconds=FEED_ACTIVE_WINDOW_SECONDS))
-        cutoff_1h = iso(now_utc() - timedelta(seconds=FEED_FALLBACK_WINDOW_SECONDS))
-
-        def query(cutoff_iso: str):
-            # keep selection minimal so missing columns don't break
-            return (supabase.table("users")
-                    .select("user_id,username,bio_lock_url,body_asset_id,last_active")
-                    .gt("last_active", cutoff_iso)
-                    .neq("user_id", uid)
-                    .order("last_active", desc=True)
-                    .limit(FEED_LIMIT)
-                    .execute())
-
-        r = query(cutoff_5m)
-        rows = r.data or []
-        fallback = False
-        if len(rows) < 5:
-            fallback = True
-            r2 = query(cutoff_1h)
-            rows = r2.data or []
-
-        for row in rows:
-            if not row.get("bio_lock_url"):
-                row["bio_lock_url"] = f"/dev/fake_image/{(safe_int(row.get('user_id')) % FAKE_TARGET_COUNT) + 1}.svg"
-            if not row.get("username"):
-                row["username"] = f"Citizen_{safe_int(row.get('user_id'))}"
-
-        if rows:
-            return {"status": "ok", "feed": rows[:FEED_LIMIT], "fallback": fallback, "fake": False}
-
-        return fake_feed()
-    except Exception:
-        return fake_feed()
-
-# =========================
-# SWIPE (schema-safe)
-# - Always increments AP
-# - Increments swipes_today if column exists; if not, we still compute it in response (from a local fallback)
-# - Triggers ambush every 10th swipe
-# =========================
-@app.post("/game/swipe")
-async def swipe(req: dict):
-    init_data = req.get("initData") or "debug_mode"
-    direction = (req.get("direction") or "").upper()
-    target_id = safe_int(req.get("target_id"))
-
-    if direction not in ("LIGHT", "SPITE"):
-        return {"status": "error", "msg": "BAD_DIRECTION"}
-
-    u = validate_auth(init_data)
-    uid = safe_int(u.get("id"))
-
-    # DEV MODE
-    if not supabase:
-        me = DEV_USERS.get(uid)
-        if not me:
-            me = normalize_user_state({"user_id": uid, "username": u.get("username","Citizen")})
-            if len(DEV_USERS) < FOUNDERS_LIMIT:
-                me = assign_founder_flags_for_new_user(me)
-            DEV_USERS[uid] = me
-
-        me = normalize_user_state(me)
-        me = apply_energy_regen(apply_daily_reset(me))
-
-        swipes_today = safe_int(me.get("swipes_today"), 0)
-        burn = ENERGY_COST_AFTER_FREE if swipes_today >= FREE_SWIPES_PER_DAY else 0
-        energy = safe_int(me.get("energy"), ENERGY_MAX)
-        if burn and energy <= 0:
-            return {"status": "error", "msg": "NO_ENERGY"}
-
-        swipes_today += 1
-        energy = max(0, energy - burn)
-
-        ap = safe_int(me.get("ap"), 0) + 1
-        me["ap"] = ap
-        me["energy"] = energy
-        me["swipes_today"] = swipes_today
-        me["last_active"] = iso(now_utc())
-
-        DEV_USERS[uid] = me
-        DEV_SWIPES.append({"swiper_id": uid, "target_id": target_id, "direction": direction, "created_at": iso(now_utc())})
-
-        ambush = (swipes_today % AMBUSH_EVERY_N_SWIPES == 0)
-        return {
-            "status": "ok",
-            "new_ap": ap,
-            "new_energy": energy,
-            "swipes_today": swipes_today,
-            "ambush": ambush,
-            "energy_max": ENERGY_MAX,
-            "free_swipes_per_day": FREE_SWIPES_PER_DAY,
-            "fake_target": is_fake_user_id(target_id),
-        }
-
-    # SUPABASE MODE
-    try:
-        row = supa_get_user(uid)
-        if not row:
-            # auto-create user (safe insert)
-            me = normalize_user_state({"user_id": uid, "username": u.get("username","Citizen")})
-            count = supa_count_users_best_effort()
-            if count < FOUNDERS_LIMIT:
-                me = assign_founder_flags_for_new_user(me)
-            supa_safe_insert("users", me)
-            row = supa_get_user(uid) or {}
-
-        me = normalize_user_state(row)
-        me = apply_energy_regen(apply_daily_reset(me))
-
-        # IMPORTANT: if your table doesn't have swipes_today, we keep a runtime-only counter fallback = 0
-        swipes_today = safe_int(me.get("swipes_today"), 0)
-        energy = safe_int(me.get("energy"), ENERGY_MAX)
-        ap = safe_int(me.get("ap"), 0)
-
-        burn = ENERGY_COST_AFTER_FREE if swipes_today >= FREE_SWIPES_PER_DAY else 0
-        if burn and energy <= 0:
-            return {"status": "error", "msg": "NO_ENERGY"}
-
-        swipes_today += 1
-        energy = max(0, energy - burn)
-        ap += 1
-
-        updates = {
-            "last_active": iso(now_utc()),
-            "ap": ap,
-            "energy": energy,
-            "energy_updated_at": me.get("energy_updated_at"),
-            "swipes_today": swipes_today,
-            "swipes_day_key": me.get("swipes_day_key"),
-            # these may NOT exist; safe updater strips them if missing
-            "init_light": safe_int(me.get("init_light"), 0) + (1 if direction == "LIGHT" else 0),
-            "init_spite": safe_int(me.get("init_spite"), 0) + (1 if direction == "SPITE" else 0),
-        }
-
-        supa_safe_update("users", "user_id", uid, updates)
-
-        # best-effort swipe logging (if table exists and cols exist)
-        try:
-            supa_safe_insert("swipes", {
-                "swiper_id": uid,
-                "target_id": target_id,
-                "direction": direction,
-                "created_at": iso(now_utc()),
-            })
-        except Exception:
-            pass
-
-        ambush = (swipes_today % AMBUSH_EVERY_N_SWIPES == 0)
-
-        return {
-            "status": "ok",
-            "new_ap": ap,
-            "new_energy": energy,
-            "swipes_today": swipes_today,
-            "ambush": ambush,
-            "energy_max": ENERGY_MAX,
-            "free_swipes_per_day": FREE_SWIPES_PER_DAY,
-            "fake_target": is_fake_user_id(target_id),
-        }
-    except Exception as e:
-        return {"status": "error", "msg": str(e)}
-
-# =========================
-# COMBAT (fake simulation)
-# =========================
-@app.post("/game/combat/info")
-async def combat_info(req: dict):
-    init_data = req.get("initData") or "debug_mode"
-    u = validate_auth(init_data)
-    uid = safe_int(u.get("id"))
-
-    boss_id = safe_int(req.get("boss_id"), 0)
-    if boss_id <= 0:
-        boss_id = ((uid + int(time.time() // 3600)) % FAKE_BOSS_COUNT) + 1
-
-    ap = 0
-    faction = "UNSORTED"
-    is_founder = False
-
-    if not supabase:
-        me = DEV_USERS.get(uid) or normalize_user_state({"user_id": uid, "username": u.get("username","Citizen")})
-        ap = safe_int(me.get("ap"), 0)
-        faction = me.get("faction", "UNSORTED")
-        is_founder = bool(me.get("is_founder"))
-    else:
-        try:
-            row = supa_get_user(uid) or {}
-            ap = safe_int(row.get("ap"), 0)
-            faction = row.get("faction") or "UNSORTED"
-            is_founder = bool(row.get("is_founder"))
-        except Exception:
-            pass
-
-    base_hp = 100
-    if is_founder and ap < 50:
-        base_hp = 80
-
-    hp = base_hp + min(320, ap * 2)
-    dmg_mult = 1.05 if faction == "DISSONANCE" else 1.0
-
-    return {
-        "status": "ok",
-        "boss": {
-            "id": boss_id,
-            "name": f"AMBUSH_ENTITY_{boss_id:02d}",
-            "hp": hp,
-            "img": f"/dev/boss/{boss_id}.svg",
-        },
-        "dmg_mult": dmg_mult,
-    }
-
-@app.post("/game/combat/turn")
-async def combat_turn(req: dict):
-    init_data = req.get("initData") or "debug_mode"
-    action = (req.get("action") or "").upper()
-    boss_hp_current = safe_int(req.get("boss_hp_current"), 100)
-    boss_id = safe_int(req.get("boss_id"), 1)
-
-    if action not in ("ATTACK", "POTION_HP"):
-        return {"status": "error", "msg": "BAD_ACTION"}
-
-    u = validate_auth(init_data)
-    uid = safe_int(u.get("id"))
-
-    faction = "UNSORTED"
-    if not supabase:
-        me = DEV_USERS.get(uid) or normalize_user_state({"user_id": uid, "username": u.get("username","Citizen")})
-        faction = me.get("faction", "UNSORTED")
-    else:
-        try:
-            row = supa_get_user(uid) or {}
-            faction = row.get("faction") or "UNSORTED"
-        except Exception:
-            pass
-
-    dmg_mult = 1.05 if faction == "DISSONANCE" else 1.0
-
-    if action == "ATTACK":
-        dmg = int(random.randint(10, 18) * dmg_mult)
-        new_hp = max(0, boss_hp_current - dmg)
-    else:
-        dmg = 0
-        new_hp = boss_hp_current
-
-    boss_hit = random.randint(7, 14)
-
-    if new_hp <= 0:
-        loot_id = random.choice(["SPONSOR_CRATE_COMMON", "SPONSOR_CRATE_RARE", "POTION_HP", "POTION_ENERGY"])
-
-        if not supabase:
-            DEV_INVENTORY.setdefault(uid, []).append({
-                "item_id": loot_id,
-                "boss_id": boss_id,
-                "rarity": "RARE" if "RARE" in loot_id else "COMMON",
-                "created_at": iso(now_utc()),
-            })
-        else:
-            # best-effort inventory insert (won't crash if table/cols don't exist)
-            try:
-                supa_safe_insert("inventory", {
-                    "user_id": uid,
-                    "item_id": loot_id,
-                    "item_type": "CRATE" if "CRATE" in loot_id else "POTION",
-                    "rarity": "RARE" if "RARE" in loot_id else "COMMON",
-                    "durability": 100,
-                    "is_equipped": False,
-                    "created_at": iso(now_utc()),
-                })
-            except Exception:
-                pass
-
-        return {"status": "VICTORY", "new_boss_hp": 0, "loot": loot_id, "boss_hit": boss_hit, "boss_id": boss_id}
-
-    return {"status": "OK", "new_boss_hp": new_hp, "damage_done": dmg, "boss_hit": boss_hit, "boss_id": boss_id}
