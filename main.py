@@ -210,3 +210,39 @@ async def reset_user(req: ResetReq):
         return {"status": "RESET_COMPLETE"}
     except Exception as e:
         return {"status": "error", "msg": str(e)}
+# ===============================
+# PROFILE: EMAIL REGISTRATION
+# ===============================
+
+from pydantic import BaseModel, EmailStr
+
+class EmailPayload(BaseModel):
+    initData: str | None = None
+    email: EmailStr
+
+@app.post("/profile/email")
+async def save_email(payload: EmailPayload):
+    try:
+        # Authenticate user (Telegram or debug)
+        u_data = validate_auth(payload.initData or "debug_mode")
+        uid = u_data["id"]
+
+        # Save email to users table
+        res = supabase.table("users") \
+            .update({
+                "email": payload.email,
+                "email_verified": True
+            }) \
+            .eq("user_id", uid) \
+            .execute()
+
+        return {
+            "status": "ok",
+            "ap_awarded": 500
+        }
+
+    except Exception as e:
+        return {
+            "status": "error",
+            "msg": str(e)
+        }
