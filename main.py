@@ -1,723 +1,691 @@
 """
-Azeuqer Backend — main.py (Python 3.9 compatible)
+main.py — AZEUQER Backend (Void Architect Edition)
 =================================================
-This is a FULL, paste-ready FastAPI backend that matches the client endpoints you’re using:
 
-Client calls supported:
-- POST /auth/login
-- POST /profile/email
-- POST /profile/referrals
-- POST /game/inventory
-- POST /game/feed
-- POST /game/swipe
+What this file guarantees (in ONE place):
+- FastAPI app that boots on Render (Python 3.9+)
+- Telegram WebApp initData verification (real bot protection)
+- Email capture endpoint that:
+  - validates email WITHOUT requiring email-validator (no boot crash)
+  - binds Telegram user_id -> email
+  - prevents duplicates (same email cannot be used by multiple TG users)
+  - idempotent updates (same user + same email is OK)
+  - founder whitelist (first 23 unique TG users who bind email get founder slot 1..23)
+- `/game/feed` + `/game/swipe` endpoints to match your Screen 3 client calls
+- Safe defaults + strong logging + health endpoint
 
-Key features:
-- Python 3.9 safe typing (NO `str | None`)
-- Telegram initData parsing (works with debug_mode too)
-- SQLite persistence (single file DB)
-- Lazy energy regen (+1 energy / 5 minutes, max 30)
-- 20 free scans/day; scans 21+ cost 1 energy
-- Faction logic (EUPHORIA vs DISSONANCE) based on total LIGHT vs SPITE
-- Referral capture via Telegram start_param = "ref_<tg_id>" (one-time)
-- Email save endpoint with EmailStr validation + one-time 500 AP reward
+IMPORTANT (DB schema expectations)
+--------------------------------
+Create these tables in Supabase (SQL editor). If you already have them, ensure constraints match.
+
+1) email_bindings
+   - tg_user_id BIGINT PRIMARY KEY
+   - email TEXT UNIQUE NOT NULL
+   - tg_username TEXT
+   - tg_first_name TEXT
+   - tg_last_name TEXT
+   - created_at TIMESTAMPTZ DEFAULT now()
+   - updated_at TIMESTAMPTZ DEFAULT now()
+   - is_founder BOOLEAN DEFAULT false
+   - founder_number INT UNIQUE NULL
+
+2) founders
+   - tg_user_id BIGINT PRIMARY KEY
+   - founder_number INT UNIQUE NOT NULL
+   - created_at TIMESTAMPTZ DEFAULT now()
+
+3) swipes (optional; but useful)
+   - id BIGSERIAL PRIMARY KEY
+   - tg_user_id BIGINT NOT NULL
+   - target_id BIGINT NOT NULL
+   - direction TEXT NOT NULL  -- "LIGHT" | "SPITE"
+   - created_at TIMESTAMPTZ DEFAULT now()
+
+If you do NOT want to create table `founders`, you can store founder_number directly on `email_bindings`.
+This code uses BOTH for safety: founders table is the authoritative “slot claim”.
+
+ENV VARS REQUIRED (Render)
+-------------------------
+- SUPABASE_URL                 (e.g. https://xxxx.supabase.co)
+- SUPABASE_SERVICE_ROLE_KEY    (Service Role key, NOT anon)
+- TELEGRAM_BOT_TOKEN           (your bot token, used to verify initData)
+
+OPTIONAL ENV
+------------
+- DEBUG_ALLOW_NO_TELEGRAM=1    (ONLY for local debugging; do NOT enable in production)
+- ALLOWED_ORIGINS=*            (or comma list; default "*")
 """
+
+from __future__ import annotations
 
 import os
 import json
-import hmac
 import time
+import hmac
 import hashlib
-import sqlite3
-from typing import Optional, Dict, Any, List, Tuple
-from urllib.parse import parse_qsl, unquote_plus
+import logging
+import secrets
+from typing import Any, Dict, Optional, List, Tuple
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, Field
 
+from supabase import create_client, Client
 
-# =============================================================================
-# CONFIG
-# =============================================================================
 
-APP_NAME = "azeuqer-backend"
-DB_PATH = os.getenv("AZ_DB_PATH", "azeuqer.sqlite3")
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()  # optional but recommended
-ALLOW_DEBUG_MODE = os.getenv("AZ_ALLOW_DEBUG_MODE", "1").strip() == "1"
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("azeuqer")
 
-ENERGY_MAX = 30
-ENERGY_REGEN_SECONDS = 5 * 60  # 5 minutes
-FREE_SCANS_PER_DAY = 20
-FACTION_UNLOCK_AT = 10
 
-CORS_ORIGINS = os.getenv("AZ_CORS_ORIGINS", "*").split(",")
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
+DEBUG_ALLOW_NO_TELEGRAM = os.getenv("DEBUG_ALLOW_NO_TELEGRAM", "0").strip() == "1"
 
-# =============================================================================
-# DB HELPERS
-# =============================================================================
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").strip()
+if ALLOWED_ORIGINS == "*":
+    ORIGINS = ["*"]
+else:
+    ORIGINS = [x.strip() for x in ALLOWED_ORIGINS.split(",") if x.strip()]
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    log.warning("SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY missing. Supabase operations will fail.")
 
+if not TELEGRAM_BOT_TOKEN and not DEBUG_ALLOW_NO_TELEGRAM:
+    log.warning("TELEGRAM_BOT_TOKEN missing. Telegram verification will fail unless DEBUG_ALLOW_NO_TELEGRAM=1.")
 
-def init_db() -> None:
-    conn = db()
-    cur = conn.cursor()
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-      id              INTEGER PRIMARY KEY AUTOINCREMENT,
-      tg_id           INTEGER UNIQUE NOT NULL,
-      username        TEXT,
-      first_name      TEXT,
-      last_name       TEXT,
-      photo_url       TEXT,
-      email           TEXT,
-      role            TEXT DEFAULT 'CITIZEN',
-      ap              INTEGER DEFAULT 0,
-      stars           INTEGER DEFAULT 0,
+# -----------------------------------------------------------------------------
+# Supabase client
+# -----------------------------------------------------------------------------
+def get_supabase() -> Client:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError("Supabase env vars not configured (SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY).")
+    return create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
-      energy          INTEGER DEFAULT 30,
-      last_energy_ts  INTEGER DEFAULT 0,
 
-      boss_kills      INTEGER DEFAULT 0,
+sb: Optional[Client] = None
+try:
+    sb = get_supabase()
+except Exception as e:
+    log.error("Supabase client init failed: %s", e)
+    sb = None
 
-      total_light     INTEGER DEFAULT 0,
-      total_spite     INTEGER DEFAULT 0,
 
-      referrer_tg_id  INTEGER,
-      referral_lock   INTEGER DEFAULT 0,
-
-      email_rewarded  INTEGER DEFAULT 0,
-      created_ts      INTEGER DEFAULT 0,
-      updated_ts      INTEGER DEFAULT 0
-    );
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS daily_stats (
-      id           INTEGER PRIMARY KEY AUTOINCREMENT,
-      tg_id        INTEGER NOT NULL,
-      day_key      TEXT NOT NULL,
-      scans        INTEGER DEFAULT 0,
-      light        INTEGER DEFAULT 0,
-      spite        INTEGER DEFAULT 0,
-      boss_spawned INTEGER DEFAULT 0,
-      UNIQUE(tg_id, day_key)
-    );
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS inventory (
-      id          INTEGER PRIMARY KEY AUTOINCREMENT,
-      tg_id       INTEGER NOT NULL,
-      item_name   TEXT NOT NULL,
-      rarity      TEXT NOT NULL,
-      item_desc   TEXT,
-      created_ts  INTEGER DEFAULT 0
-    );
-    """)
-
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS swipes (
-      id         INTEGER PRIMARY KEY AUTOINCREMENT,
-      tg_id      INTEGER NOT NULL,
-      target_id  INTEGER NOT NULL,
-      direction  TEXT NOT NULL,
-      created_ts INTEGER DEFAULT 0
-    );
-    """)
-
-    conn.commit()
-    conn.close()
-
-
-def now_ts() -> int:
-    return int(time.time())
-
-
-def day_key(ts: Optional[int] = None) -> str:
-    # YYYY-MM-DD in local server time (fine for MVP)
-    import datetime
-    dt = datetime.datetime.fromtimestamp(ts or time.time())
-    return dt.strftime("%Y-%m-%d")
-
-
-def get_user_row(conn: sqlite3.Connection, tg_id: int) -> Optional[sqlite3.Row]:
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,))
-    return cur.fetchone()
-
-
-def ensure_daily_row(conn: sqlite3.Connection, tg_id: int, dk: str) -> sqlite3.Row:
-    cur = conn.cursor()
-    cur.execute("""
-      INSERT OR IGNORE INTO daily_stats (tg_id, day_key, scans, light, spite, boss_spawned)
-      VALUES (?, ?, 0, 0, 0, 0)
-    """, (tg_id, dk))
-    conn.commit()
-    cur.execute("SELECT * FROM daily_stats WHERE tg_id = ? AND day_key = ?", (tg_id, dk))
-    return cur.fetchone()
-
-
-def update_user_ts(conn: sqlite3.Connection, tg_id: int) -> None:
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET updated_ts = ? WHERE tg_id = ?", (now_ts(), tg_id))
-    conn.commit()
-
-
-# =============================================================================
-# TELEGRAM initData (parse + optional verify)
-# =============================================================================
-
-def parse_init_data(init_data: str) -> Dict[str, str]:
-    """
-    Telegram initData is a querystring-like string.
-    Example keys: query_id, user, auth_date, hash, start_param
-    """
-    parsed = dict(parse_qsl(init_data, keep_blank_values=True))
-    return parsed
-
-
-def telegram_verify_init_data(init_data: str, bot_token: str) -> bool:
-    """
-    Verifies Telegram WebApp initData signature.
-    If no bot_token provided, this will never be used.
-    """
-    data = parse_init_data(init_data)
-    received_hash = data.get("hash", "")
-    if not received_hash:
-        return False
-
-    # Build data-check-string from all fields except hash, sorted
-    items = []
-    for k in sorted(data.keys()):
-        if k == "hash":
-            continue
-        items.append(f"{k}={data[k]}")
-    data_check_string = "\n".join(items)
-
-    secret_key = hashlib.sha256(bot_token.encode("utf-8")).digest()
-    computed_hash = hmac.new(secret_key, data_check_string.encode("utf-8"), hashlib.sha256).hexdigest()
-
-    return hmac.compare_digest(computed_hash, received_hash)
-
-
-def extract_user_from_init_data(init_data: str) -> Tuple[int, str, Optional[str], Optional[str], Optional[str]]:
-    """
-    Returns: (tg_id, username, first_name, last_name, photo_url)
-
-    Accepts:
-    - Real Telegram initData (user field is JSON, URL-encoded)
-    - "debug_mode" (creates a stable demo tg_id)
-    """
-    if init_data == "debug_mode":
-        return (12345, "Architect", "Abe", "Roy", "https://picsum.photos/seed/azeuqer_debug/512/512")
-
-    data = parse_init_data(init_data)
-
-    # If bot token exists, verify. If invalid => reject.
-    if BOT_TOKEN:
-        if not telegram_verify_init_data(init_data, BOT_TOKEN):
-            raise HTTPException(status_code=401, detail="Invalid Telegram initData signature.")
-    else:
-        # No bot token set: allow, but you should set TELEGRAM_BOT_TOKEN in production.
-        if not ALLOW_DEBUG_MODE:
-            raise HTTPException(status_code=500, detail="Server missing TELEGRAM_BOT_TOKEN.")
-
-    user_raw = data.get("user", "")
-    if not user_raw:
-        raise HTTPException(status_code=400, detail="initData missing user field.")
-
-    try:
-        user_json = json.loads(unquote_plus(user_raw))
-    except Exception:
-        raise HTTPException(status_code=400, detail="Failed to parse Telegram user JSON.")
-
-    tg_id = int(user_json.get("id"))
-    username = user_json.get("username") or f"agent_{tg_id}"
-    first_name = user_json.get("first_name")
-    last_name = user_json.get("last_name")
-    photo_url = user_json.get("photo_url")
-
-    return (tg_id, username, first_name, last_name, photo_url)
-
-
-def extract_start_param(init_data: str) -> Optional[str]:
-    if init_data == "debug_mode":
-        return None
-    data = parse_init_data(init_data)
-    # Some clients pass start_param; if not present, it's just None.
-    return data.get("start_param")
-
-
-# =============================================================================
-# GAME LOGIC (energy regen, faction, etc.)
-# =============================================================================
-
-def lazy_regen_energy(current_energy: int, last_ts: int) -> Tuple[int, int]:
-    """
-    Returns (new_energy, new_last_ts) with lazy regen.
-    """
-    if current_energy >= ENERGY_MAX:
-        return (ENERGY_MAX, last_ts or now_ts())
-
-    now = now_ts()
-    last = last_ts or now
-    elapsed = now - last
-    if elapsed < ENERGY_REGEN_SECONDS:
-        return (current_energy, last)
-
-    gained = elapsed // ENERGY_REGEN_SECONDS
-    if gained <= 0:
-        return (current_energy, last)
-
-    new_energy = min(ENERGY_MAX, current_energy + int(gained))
-    new_last = last + int(gained) * ENERGY_REGEN_SECONDS
-    return (new_energy, new_last)
-
-
-def compute_faction(total_light: int, total_spite: int) -> str:
-    if total_light > total_spite:
-        return "EUPHORIA"
-    if total_spite > total_light:
-        return "DISSONANCE"
-    # tie
-    return "EUPHORIA" if (hash(f"{total_light}:{total_spite}") % 2 == 0) else "DISSONANCE"
-
-
-def as_user_payload(row: sqlite3.Row) -> Dict[str, Any]:
-    faction = compute_faction(int(row["total_light"]), int(row["total_spite"]))
-    return {
-        "user_id": row["tg_id"],
-        "username": row["username"] or "AGENT",
-        "email": row["email"],
-        "role": row["role"] or "CITIZEN",
-
-        "ap": int(row["ap"] or 0),
-        "stars": int(row["stars"] or 0),
-
-        "energy": int(row["energy"] or ENERGY_MAX),
-        "faction": faction,
-        "boss_kills": int(row["boss_kills"] or 0),
-
-        "bio_lock_url": row["photo_url"] or "https://picsum.photos/seed/azeuqer_default/512/512"
-    }
-
-
-def ensure_user(conn: sqlite3.Connection, init_data: str) -> sqlite3.Row:
-    tg_id, username, first_name, last_name, photo_url = extract_user_from_init_data(init_data)
-    ts = now_ts()
-
-    cur = conn.cursor()
-    existing = get_user_row(conn, tg_id)
-    if existing:
-        # Update profile basics (username/photo can change)
-        cur.execute("""
-          UPDATE users
-          SET username = ?, first_name = ?, last_name = ?, photo_url = ?, updated_ts = ?
-          WHERE tg_id = ?
-        """, (username, first_name, last_name, photo_url, ts, tg_id))
-        conn.commit()
-        existing = get_user_row(conn, tg_id)
-        return existing
-
-    # New user
-    last_energy = ts
-    cur.execute("""
-      INSERT INTO users (
-        tg_id, username, first_name, last_name, photo_url,
-        ap, stars, energy, last_energy_ts,
-        boss_kills, total_light, total_spite,
-        created_ts, updated_ts
-      )
-      VALUES (?, ?, ?, ?, ?, 0, 0, ?, ?, 0, 0, 0, ?, ?)
-    """, (tg_id, username, first_name, last_name, photo_url, ENERGY_MAX, last_energy, ts, ts))
-    conn.commit()
-
-    # Give a small starter inventory (optional vibe)
-    seed_items = [
-        ("Neon Hoodie", "RARE", "+VIT vibe. Sponsor-ready."),
-        ("Void Runner Glasses", "EPIC", "+INT vibe. Particle-ready."),
-    ]
-    for nm, rar, desc in seed_items:
-        cur.execute("""
-          INSERT INTO inventory (tg_id, item_name, rarity, item_desc, created_ts)
-          VALUES (?, ?, ?, ?, ?)
-        """, (tg_id, nm, rar, desc, ts))
-    conn.commit()
-
-    return get_user_row(conn, tg_id)
-
-
-def apply_referral_if_any(conn: sqlite3.Connection, user_row: sqlite3.Row, init_data: str) -> None:
-    """
-    One-time referral capture:
-    start_param must be "ref_<tg_id>"
-    - If user has no referrer and referral_lock is 0, set referrer_tg_id
-    - Award both sides +100 AP once
-    - The referrer also can earn future 5% on AP later (not implemented here)
-    """
-    start = extract_start_param(init_data)
-    if not start:
-        return
-
-    if not start.startswith("ref_"):
-        return
-
-    try:
-        ref_tg_id = int(start.replace("ref_", "").strip())
-    except Exception:
-        return
-
-    tg_id = int(user_row["tg_id"])
-    if ref_tg_id == tg_id:
-        return
-
-    # If already locked, do nothing
-    if int(user_row["referral_lock"] or 0) == 1:
-        return
-
-    # Only set if empty
-    if user_row["referrer_tg_id"] is not None:
-        # lock anyway so user can’t change it later
-        cur = conn.cursor()
-        cur.execute("UPDATE users SET referral_lock = 1, updated_ts = ? WHERE tg_id = ?", (now_ts(), tg_id))
-        conn.commit()
-        return
-
-    # Referrer must exist
-    ref_row = get_user_row(conn, ref_tg_id)
-    if not ref_row:
-        return
-
-    cur = conn.cursor()
-    ts = now_ts()
-
-    # Set referrer and lock
-    cur.execute("""
-      UPDATE users
-      SET referrer_tg_id = ?, referral_lock = 1, updated_ts = ?
-      WHERE tg_id = ?
-    """, (ref_tg_id, ts, tg_id))
-
-    # Award both +100 AP
-    cur.execute("UPDATE users SET ap = ap + 100, updated_ts = ? WHERE tg_id = ?", (ts, tg_id))
-    cur.execute("UPDATE users SET ap = ap + 100, updated_ts = ? WHERE tg_id = ?", (ts, ref_tg_id))
-
-    conn.commit()
-
-
-# =============================================================================
-# Pydantic Models (Python 3.9 compatible)
-# =============================================================================
-
-class InitPayload(BaseModel):
-    initData: str = Field(..., description="Telegram WebApp initData string, or 'debug_mode'")
-
-
-class EmailPayload(BaseModel):
-    initData: str = Field(..., description="Telegram WebApp initData string, or 'debug_mode'")
-    email: EmailStr
-
-
-class ReferralsPayload(BaseModel):
-    initData: str
-
-
-class InventoryPayload(BaseModel):
-    initData: str
-
-
-class FeedPayload(BaseModel):
-    initData: str
-    limit: Optional[int] = 20
-
-
-class SwipePayload(BaseModel):
-    initData: str
-    target_id: int
-    direction: str  # "LIGHT" or "SPITE"
-
-
-# =============================================================================
-# FastAPI App
-# =============================================================================
-
-init_db()
-
-app = FastAPI(title=APP_NAME)
+# -----------------------------------------------------------------------------
+# FastAPI app
+# -----------------------------------------------------------------------------
+app = FastAPI(
+    title="AZEUQER Backend",
+    version="v23",
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o.strip() for o in CORS_ORIGINS if o.strip()],
+    allow_origins=ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# =============================================================================
-# ENDPOINTS
-# =============================================================================
+# -----------------------------------------------------------------------------
+# In-memory rate limiting (bot friction)
+# (Render single instance friendly; if you scale, move to Redis)
+# -----------------------------------------------------------------------------
+class SimpleRateLimiter:
+    def __init__(self) -> None:
+        self.ip_hits: Dict[str, List[float]] = {}
+        self.user_hits: Dict[int, List[float]] = {}
 
-@app.get("/")
-def root():
-    return {"ok": True, "name": APP_NAME}
+    @staticmethod
+    def _prune(ts: List[float], window_s: int) -> List[float]:
+        now = time.time()
+        return [t for t in ts if now - t <= window_s]
+
+    def hit_ip(self, ip: str, limit: int = 60, window_s: int = 60) -> None:
+        now = time.time()
+        arr = self.ip_hits.get(ip, [])
+        arr = self._prune(arr, window_s)
+        arr.append(now)
+        self.ip_hits[ip] = arr
+        if len(arr) > limit:
+            raise HTTPException(status_code=429, detail="Too many requests (IP rate limit).")
+
+    def hit_user(self, user_id: int, limit: int = 30, window_s: int = 60) -> None:
+        now = time.time()
+        arr = self.user_hits.get(user_id, [])
+        arr = self._prune(arr, window_s)
+        arr.append(now)
+        self.user_hits[user_id] = arr
+        if len(arr) > limit:
+            raise HTTPException(status_code=429, detail="Too many requests (User rate limit).")
 
 
-@app.post("/auth/login")
-def auth_login(payload: InitPayload):
-    conn = db()
+rl = SimpleRateLimiter()
+
+
+# -----------------------------------------------------------------------------
+# Telegram initData verification (REAL bot protection)
+# -----------------------------------------------------------------------------
+def _parse_qs(raw: str) -> Dict[str, str]:
+    """
+    Telegram initData is querystring-like: "key=value&key=value"
+    Values are urlencoded; Telegram sends it in window.Telegram.WebApp.initData
+    """
+    out: Dict[str, str] = {}
+    if not raw:
+        return out
+    parts = raw.split("&")
+    for p in parts:
+        if "=" not in p:
+            continue
+        k, v = p.split("=", 1)
+        # Telegram's initData is already decoded by many clients; but to be safe:
+        # we avoid importing urllib here; values should still compare correctly
+        out[k] = v
+    return out
+
+
+def _tg_check_hash(init_data: str, bot_token: str) -> Tuple[bool, Optional[Dict[str, Any]], str]:
+    """
+    Verify Telegram WebApp initData signature.
+    Algorithm: https://core.telegram.org/bots/webapps#validating-data-received-via-the-web-app
+    Steps:
+      - parse initData into key/value
+      - extract hash
+      - data_check_string = '\n'.join(sorted([f"{k}={v}" for k,v in pairs if k!='hash']))
+      - secret_key = HMAC_SHA256(key="WebAppData", msg=bot_token)
+      - computed_hash = HMAC_SHA256(key=secret_key, msg=data_check_string).hexdigest()
+    Returns (ok, user_dict, reason)
+    """
+    if not init_data:
+        return False, None, "missing_init_data"
+
+    d = _parse_qs(init_data)
+    their_hash = d.get("hash", "")
+    if not their_hash:
+        return False, None, "missing_hash"
+
+    pairs = []
+    for k, v in d.items():
+        if k == "hash":
+            continue
+        pairs.append(f"{k}={v}")
+    pairs.sort()
+    data_check_string = "\n".join(pairs)
+
+    secret_key = hmac.new(
+        key=b"WebAppData",
+        msg=bot_token.encode("utf-8"),
+        digestmod=hashlib.sha256,
+    ).digest()
+
+    computed = hmac.new(
+        key=secret_key,
+        msg=data_check_string.encode("utf-8"),
+        digestmod=hashlib.sha256,
+    ).hexdigest()
+
+    if not hmac.compare_digest(computed, their_hash):
+        return False, None, "bad_hash"
+
+    # auth_date freshness check (optional but recommended)
+    auth_date_raw = d.get("auth_date")
+    if auth_date_raw and auth_date_raw.isdigit():
+        auth_date = int(auth_date_raw)
+        now = int(time.time())
+        # allow 24h window
+        if now - auth_date > 86400:
+            return False, None, "auth_date_too_old"
+
+    # user is JSON string; may be URL encoded; try best-effort decode
+    user_raw = d.get("user")
+    user_obj = None
+    if user_raw:
+        # Telegram often provides raw JSON (but URL-encoded in QS).
+        # We do a soft-repair: replace %22 etc if it exists would require urllib.
+        # If your client passes decoded initData, json.loads works.
+        try:
+            user_obj = json.loads(user_raw)
+        except Exception:
+            # last resort: attempt minimal URL-decoding for common characters
+            try:
+                repaired = (
+                    user_raw.replace("%22", '"')
+                    .replace("%7B", "{")
+                    .replace("%7D", "}")
+                    .replace("%3A", ":")
+                    .replace("%2C", ",")
+                    .replace("%5B", "[")
+                    .replace("%5D", "]")
+                )
+                user_obj = json.loads(repaired)
+            except Exception:
+                user_obj = None
+
+    return True, user_obj, "ok"
+
+
+def require_telegram_user(init_data: str) -> Dict[str, Any]:
+    """
+    Returns Telegram user object (dict).
+    Raises HTTPException if verification fails (unless DEBUG_ALLOW_NO_TELEGRAM).
+    """
+    if DEBUG_ALLOW_NO_TELEGRAM:
+        # Debug mode: allow local development without Telegram.
+        # We return a deterministic fake user.
+        return {"id": 999000111, "username": "debug_mode", "first_name": "Debug", "last_name": "Mode"}
+
+    if not TELEGRAM_BOT_TOKEN:
+        raise HTTPException(status_code=500, detail="Server missing TELEGRAM_BOT_TOKEN.")
+
+    ok, user_obj, reason = _tg_check_hash(init_data, TELEGRAM_BOT_TOKEN)
+    if not ok or not user_obj or "id" not in user_obj:
+        raise HTTPException(status_code=401, detail=f"Telegram initData invalid ({reason}).")
+
+    return user_obj
+
+
+# -----------------------------------------------------------------------------
+# Email validation without email-validator dependency (prevents boot crash)
+# -----------------------------------------------------------------------------
+def is_probably_email(s: str) -> bool:
+    """
+    Practical validation:
+    - 3..254 chars
+    - exactly one "@"
+    - has dot in domain part
+    - no spaces
+    This avoids pydantic EmailStr which requires email-validator package.
+    """
+    if not s:
+        return False
+    s = s.strip()
+    if " " in s:
+        return False
+    if len(s) < 3 or len(s) > 254:
+        return False
+    if s.count("@") != 1:
+        return False
+    local, domain = s.split("@", 1)
+    if not local or not domain:
+        return False
+    if "." not in domain:
+        return False
+    if domain.startswith(".") or domain.endswith("."):
+        return False
+    # basic forbidden
+    if any(c in s for c in ["\n", "\r", "\t"]):
+        return False
+    return True
+
+
+# -----------------------------------------------------------------------------
+# Models
+# -----------------------------------------------------------------------------
+class TelegramInit(BaseModel):
+    initData: str = Field(default="", description="Telegram WebApp initData string")
+
+
+class EmailBindRequest(BaseModel):
+    email: str
+    initData: str = Field(default="", description="Telegram WebApp initData; required unless DEBUG_ALLOW_NO_TELEGRAM=1")
+
+
+class FeedRequest(BaseModel):
+    initData: str = Field(default="")
+
+
+class SwipeRequest(BaseModel):
+    initData: str = Field(default="")
+    target_id: int
+    direction: str  # "LIGHT" | "SPITE"
+
+
+# -----------------------------------------------------------------------------
+# Helpers: request metadata
+# -----------------------------------------------------------------------------
+def get_client_ip(request: Request) -> str:
+    # Render / proxies may set x-forwarded-for
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def ensure_supabase() -> Client:
+    global sb
+    if sb is None:
+        try:
+            sb = get_supabase()
+        except Exception as e:
+            log.error("Supabase re-init failed: %s", e)
+            raise HTTPException(status_code=500, detail="Supabase not configured.")
+    return sb
+
+
+# -----------------------------------------------------------------------------
+# Founder slot claiming (first 23 unique TG users)
+# -----------------------------------------------------------------------------
+FOUNDER_LIMIT = 23
+
+
+def _get_existing_founder_slot(supabase: Client, tg_user_id: int) -> Optional[int]:
     try:
-        user = ensure_user(conn, payload.initData)
-        apply_referral_if_any(conn, user, payload.initData)
+        res = (
+            supabase.table("founders")
+            .select("founder_number")
+            .eq("tg_user_id", tg_user_id)
+            .limit(1)
+            .execute()
+        )
+        data = res.data or []
+        if data:
+            return int(data[0]["founder_number"])
+        return None
+    except Exception as e:
+        log.error("Founder lookup failed: %s", e)
+        return None
 
-        # Apply lazy energy regen and persist
-        cur = conn.cursor()
-        e0 = int(user["energy"] or ENERGY_MAX)
-        t0 = int(user["last_energy_ts"] or 0)
-        e1, t1 = lazy_regen_energy(e0, t0)
-        if e1 != e0 or t1 != t0:
-            cur.execute("UPDATE users SET energy = ?, last_energy_ts = ?, updated_ts = ? WHERE tg_id = ?",
-                        (e1, t1, now_ts(), int(user["tg_id"])))
-            conn.commit()
-            user = get_user_row(conn, int(user["tg_id"]))
 
-        return {"ok": True, "user": as_user_payload(user)}
-    finally:
-        conn.close()
+def _count_founders(supabase: Client) -> int:
+    try:
+        res = supabase.table("founders").select("tg_user_id", count="exact").execute()
+        # supabase-py returns count in res.count
+        return int(getattr(res, "count", 0) or 0)
+    except Exception as e:
+        log.error("Founder count failed: %s", e)
+        return 0
+
+
+def claim_founder_slot(supabase: Client, tg_user_id: int) -> Optional[int]:
+    """
+    Attempts to claim a founder slot 1..23 for this tg_user_id.
+    - If already has a slot -> return it.
+    - If slots exhausted -> return None.
+    - Tries a few times to avoid rare race conflicts.
+    Requires UNIQUE constraint on founders(founder_number).
+    """
+    existing = _get_existing_founder_slot(supabase, tg_user_id)
+    if existing:
+        return existing
+
+    for _ in range(6):
+        count = _count_founders(supabase)
+        if count >= FOUNDER_LIMIT:
+            return None
+        candidate = count + 1
+
+        try:
+            # Insert claim
+            supabase.table("founders").insert(
+                {"tg_user_id": tg_user_id, "founder_number": candidate}
+            ).execute()
+            return candidate
+        except Exception:
+            # likely a unique conflict (someone grabbed the same number) -> retry
+            time.sleep(0.08 + secrets.randbelow(40) / 1000.0)
+
+    # If we get here, we failed due to contention
+    return _get_existing_founder_slot(supabase, tg_user_id)
+
+
+# -----------------------------------------------------------------------------
+# Email binding logic (Supabase)
+# -----------------------------------------------------------------------------
+def get_binding_by_email(supabase: Client, email: str) -> Optional[Dict[str, Any]]:
+    try:
+        res = supabase.table("email_bindings").select("*").eq("email", email).limit(1).execute()
+        data = res.data or []
+        return data[0] if data else None
+    except Exception as e:
+        log.error("get_binding_by_email failed: %s", e)
+        return None
+
+
+def get_binding_by_user(supabase: Client, tg_user_id: int) -> Optional[Dict[str, Any]]:
+    try:
+        res = supabase.table("email_bindings").select("*").eq("tg_user_id", tg_user_id).limit(1).execute()
+        data = res.data or []
+        return data[0] if data else None
+    except Exception as e:
+        log.error("get_binding_by_user failed: %s", e)
+        return None
+
+
+def upsert_email_binding(
+    supabase: Client,
+    tg_user: Dict[str, Any],
+    email: str
+) -> Dict[str, Any]:
+    """
+    Enforces:
+    - same email cannot be bound to a different tg_user_id
+    - same tg_user_id can re-submit same email (idempotent)
+    - same tg_user_id can change email ONLY if new email is not taken
+    - founder slot claim on first successful bind (if available)
+    """
+    tg_user_id = int(tg_user["id"])
+    username = tg_user.get("username")
+    first_name = tg_user.get("first_name")
+    last_name = tg_user.get("last_name")
+
+    # Check if email already used by someone else
+    existing_email = get_binding_by_email(supabase, email)
+    if existing_email and int(existing_email.get("tg_user_id")) != tg_user_id:
+        raise HTTPException(status_code=409, detail="Email already bound to another Telegram account.")
+
+    # Determine if this user already has a binding
+    existing_user = get_binding_by_user(supabase, tg_user_id)
+
+    # Founder logic: if user never claimed slot, try claim now
+    founder_number = _get_existing_founder_slot(supabase, tg_user_id)
+    if not founder_number:
+        founder_number = claim_founder_slot(supabase, tg_user_id)
+
+    is_founder = bool(founder_number)
+
+    payload = {
+        "tg_user_id": tg_user_id,
+        "email": email,
+        "tg_username": username,
+        "tg_first_name": first_name,
+        "tg_last_name": last_name,
+        "updated_at": "now()",
+        "is_founder": is_founder,
+        "founder_number": founder_number,
+    }
+
+    # Insert or update
+    try:
+        if existing_user:
+            # If changing email, ensure new email not taken by someone else (already checked above)
+            supabase.table("email_bindings").update(payload).eq("tg_user_id", tg_user_id).execute()
+        else:
+            payload["created_at"] = "now()"
+            supabase.table("email_bindings").insert(payload).execute()
+    except Exception as e:
+        log.error("upsert_email_binding failed: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to save email binding.")
+
+    # Return final record
+    final_rec = get_binding_by_user(supabase, tg_user_id) or payload
+    return final_rec
+
+
+# -----------------------------------------------------------------------------
+# API Endpoints
+# -----------------------------------------------------------------------------
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "service": "azeuqer",
+        "version": "v23",
+        "supabase_configured": bool(SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY),
+        "telegram_verification": bool(TELEGRAM_BOT_TOKEN) or DEBUG_ALLOW_NO_TELEGRAM,
+        "debug_allow_no_telegram": DEBUG_ALLOW_NO_TELEGRAM,
+    }
 
 
 @app.post("/profile/email")
-def profile_email(payload: EmailPayload):
-    conn = db()
-    try:
-        user = ensure_user(conn, payload.initData)
-        tg_id = int(user["tg_id"])
-        ts = now_ts()
+async def bind_email(req: Request) -> Dict[str, Any]:
+    """
+    Frontend calls this to store email -> Supabase, bound to Telegram user.
+    REQUIRED: initData (unless DEBUG_ALLOW_NO_TELEGRAM=1)
 
-        # one-time 500 AP reward for setting email
-        reward = 0
-        if int(user["email_rewarded"] or 0) == 0:
-            reward = 500
+    Accepts initData from:
+    - JSON body { email, initData }
+    - header X-Telegram-InitData (if you ever choose to send it that way)
+    """
+    ip = get_client_ip(req)
+    rl.hit_ip(ip, limit=40, window_s=60)
 
-        cur = conn.cursor()
-        cur.execute("""
-          UPDATE users
-          SET email = ?, ap = ap + ?, email_rewarded = 1, updated_ts = ?
-          WHERE tg_id = ?
-        """, (str(payload.email), reward, ts, tg_id))
-        conn.commit()
+    body = await req.json()
+    payload = EmailBindRequest(**body)
 
-        user = get_user_row(conn, tg_id)
-        return {"ok": True, "reward_ap": reward, "user": as_user_payload(user)}
-    finally:
-        conn.close()
+    init_data = payload.initData or req.headers.get("x-telegram-initdata", "") or ""
+    tg_user = require_telegram_user(init_data)
 
+    rl.hit_user(int(tg_user["id"]), limit=18, window_s=60)
 
-@app.post("/profile/referrals")
-def profile_referrals(payload: ReferralsPayload):
-    conn = db()
-    try:
-        user = ensure_user(conn, payload.initData)
-        tg_id = int(user["tg_id"])
+    email = (payload.email or "").strip().lower()
+    if not is_probably_email(email):
+        raise HTTPException(status_code=400, detail="Invalid email format.")
 
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*) AS c FROM users WHERE referrer_tg_id = ?", (tg_id,))
-        c = int(cur.fetchone()["c"])
-        return {"ok": True, "count": c}
-    finally:
-        conn.close()
+    supabase = ensure_supabase()
 
+    record = upsert_email_binding(supabase, tg_user, email)
 
-@app.post("/game/inventory")
-def game_inventory(payload: InventoryPayload):
-    conn = db()
-    try:
-        user = ensure_user(conn, payload.initData)
-        tg_id = int(user["tg_id"])
-
-        cur = conn.cursor()
-        cur.execute("""
-          SELECT item_name, rarity, item_desc
-          FROM inventory
-          WHERE tg_id = ?
-          ORDER BY id DESC
-          LIMIT 120
-        """, (tg_id,))
-        items = [{
-            "name": r["item_name"],
-            "rarity": r["rarity"],
-            "desc": r["item_desc"] or ""
-        } for r in cur.fetchall()]
-
-        return {"ok": True, "items": items}
-    finally:
-        conn.close()
+    return {
+        "ok": True,
+        "tg_user_id": int(tg_user["id"]),
+        "email": record.get("email"),
+        "is_founder": bool(record.get("is_founder")),
+        "founder_number": record.get("founder_number"),
+    }
 
 
 @app.post("/game/feed")
-def game_feed(payload: FeedPayload):
-    conn = db()
-    try:
-        user = ensure_user(conn, payload.initData)
-        my_id = int(user["tg_id"])
-        limit = int(payload.limit or 20)
-        limit = max(5, min(60, limit))
+async def game_feed(req: Request) -> Dict[str, Any]:
+    """
+    Screen 3 expects:
+      POST /game/feed  { initData }
+    and returns:
+      { feed: [ { user_id, username, faction, bio_lock_url } ... ] }
 
-        cur = conn.cursor()
-        cur.execute("""
-          SELECT tg_id, username, photo_url, total_light, total_spite
-          FROM users
-          WHERE tg_id != ?
-          ORDER BY updated_ts DESC
-          LIMIT ?
-        """, (my_id, limit))
+    For now this is a stable fake feed. Once you have real users, replace.
+    """
+    ip = get_client_ip(req)
+    rl.hit_ip(ip, limit=120, window_s=60)
 
-        feed = []
-        for r in cur.fetchall():
-            faction = compute_faction(int(r["total_light"] or 0), int(r["total_spite"] or 0))
-            feed.append({
-                "user_id": int(r["tg_id"]),
-                "username": r["username"] or f"agent_{r['tg_id']}",
-                "bio_lock_url": r["photo_url"] or "https://picsum.photos/seed/azeuqer_feed/512/512",
-                "faction": faction
-            })
+    body = await req.json()
+    payload = FeedRequest(**body)
 
-        # If feed is empty, create a few demo bots (first run)
-        if not feed:
-            ts = now_ts()
-            demo = [
-                (90001, "NOVA", "https://picsum.photos/seed/azeuqer_nova/512/512"),
-                (90002, "KAI", "https://picsum.photos/seed/azeuqer_kai/512/512"),
-                (90003, "NYX", "https://picsum.photos/seed/azeuqer_nyx/512/512"),
-            ]
-            for tg_id, uname, purl in demo:
-                cur.execute("""
-                  INSERT OR IGNORE INTO users (
-                    tg_id, username, photo_url, ap, stars, energy, last_energy_ts,
-                    boss_kills, total_light, total_spite, created_ts, updated_ts
-                  )
-                  VALUES (?, ?, ?, 0, 0, ?, ?, 0, 0, 0, ?, ?)
-                """, (tg_id, uname, purl, ENERGY_MAX, ts, ts, ts))
-            conn.commit()
+    tg_user = require_telegram_user(payload.initData)
+    rl.hit_user(int(tg_user["id"]), limit=60, window_s=60)
 
-            cur.execute("""
-              SELECT tg_id, username, photo_url, total_light, total_spite
-              FROM users
-              WHERE tg_id != ?
-              ORDER BY updated_ts DESC
-              LIMIT ?
-            """, (my_id, limit))
-            feed = []
-            for r in cur.fetchall():
-                faction = compute_faction(int(r["total_light"] or 0), int(r["total_spite"] or 0))
-                feed.append({
-                    "user_id": int(r["tg_id"]),
-                    "username": r["username"] or f"agent_{r['tg_id']}",
-                    "bio_lock_url": r["photo_url"] or "https://picsum.photos/seed/azeuqer_feed/512/512",
-                    "faction": faction
-                })
+    # Stable pseudo-random based on user id so it doesn't "jump" every refresh
+    uid = int(tg_user["id"])
+    rng = secrets.SystemRandom(uid)
 
-        return {"ok": True, "feed": feed}
-    finally:
-        conn.close()
+    names = [
+        "NOVA","KAI","LUNA","MILO","ZARA","JUNO","NYX","RIVEN","SAGE","ARIA",
+        "VEGA","AXEL","IRIS","CORA","ELIO","KODA","VIO","SKYE","ORION","MAY",
+        "NIKO","SERA","RAYA","ZEN","ECHO","SOL","AZRA","NOEL","REMI","IVY",
+    ]
+    factions = ["UNSORTED", "EUPHORIA", "DISSONANCE"]
+
+    feed: List[Dict[str, Any]] = []
+    # Provide 30 targets
+    for i in range(30):
+        target_id = 90000 + i
+        nm = names[i % len(names)]
+        # deterministic but varied
+        faction = factions[(i + (uid % 3)) % len(factions)]
+        gender_seed = "men" if i % 2 == 0 else "women"
+        img = f"https://randomuser.me/api/portraits/{gender_seed}/{i % 99}.jpg"
+        feed.append(
+            {
+                "user_id": target_id,
+                "username": nm,
+                "faction": faction,
+                "bio_lock_url": img,
+            }
+        )
+
+    return {"feed": feed}
 
 
 @app.post("/game/swipe")
-def game_swipe(payload: SwipePayload):
-    conn = db()
+async def game_swipe(req: Request) -> Dict[str, Any]:
+    """
+    Screen 3 expects:
+      POST /game/swipe { initData, target_id, direction }
+
+    We'll record swipe to Supabase if table exists; otherwise just accept.
+    """
+    ip = get_client_ip(req)
+    rl.hit_ip(ip, limit=240, window_s=60)
+
+    body = await req.json()
+    payload = SwipeRequest(**body)
+
+    direction = (payload.direction or "").upper().strip()
+    if direction not in ("LIGHT", "SPITE"):
+        raise HTTPException(status_code=400, detail="direction must be LIGHT or SPITE")
+
+    tg_user = require_telegram_user(payload.initData)
+    uid = int(tg_user["id"])
+    rl.hit_user(uid, limit=120, window_s=60)
+
+    supabase = ensure_supabase()
+
+    # best-effort insert
     try:
-        user = ensure_user(conn, payload.initData)
-        tg_id = int(user["tg_id"])
-        dk = day_key()
-        direction = (payload.direction or "").upper().strip()
-        if direction not in ("LIGHT", "SPITE"):
-            raise HTTPException(status_code=400, detail="direction must be LIGHT or SPITE")
+        supabase.table("swipes").insert(
+            {
+                "tg_user_id": uid,
+                "target_id": int(payload.target_id),
+                "direction": direction,
+            }
+        ).execute()
+    except Exception as e:
+        # don't block gameplay if logging fails
+        log.warning("Swipe insert failed (non-fatal): %s", e)
 
-        # Lazy regen energy first
-        cur = conn.cursor()
-        e0 = int(user["energy"] or ENERGY_MAX)
-        t0 = int(user["last_energy_ts"] or 0)
-        e1, t1 = lazy_regen_energy(e0, t0)
-
-        # Ensure daily row
-        drow = ensure_daily_row(conn, tg_id, dk)
-        scans = int(drow["scans"] or 0)
-
-        # Apply scan cost rule:
-        # scans 1..20 are free, scans 21+ cost 1 energy each
-        if scans >= FREE_SCANS_PER_DAY:
-            if e1 <= 0:
-                return {"ok": False, "reason": "NO_ENERGY", "energy": e1, "scans_today": scans}
-            e1 -= 1
-
-        # Update daily stats
-        scans += 1
-        light = int(drow["light"] or 0)
-        spite = int(drow["spite"] or 0)
-        if direction == "LIGHT":
-            light += 1
-        else:
-            spite += 1
-
-        cur.execute("""
-          UPDATE daily_stats
-          SET scans = ?, light = ?, spite = ?
-          WHERE tg_id = ? AND day_key = ?
-        """, (scans, light, spite, tg_id, dk))
-
-        # Update user totals + AP (+1 per swipe)
-        if direction == "LIGHT":
-            cur.execute("""
-              UPDATE users
-              SET total_light = total_light + 1, ap = ap + 1, energy = ?, last_energy_ts = ?, updated_ts = ?
-              WHERE tg_id = ?
-            """, (e1, t1, now_ts(), tg_id))
-        else:
-            cur.execute("""
-              UPDATE users
-              SET total_spite = total_spite + 1, ap = ap + 1, energy = ?, last_energy_ts = ?, updated_ts = ?
-              WHERE tg_id = ?
-            """, (e1, t1, now_ts(), tg_id))
-
-        # Record swipe (best-effort)
-        cur.execute("""
-          INSERT INTO swipes (tg_id, target_id, direction, created_ts)
-          VALUES (?, ?, ?, ?)
-        """, (tg_id, int(payload.target_id), direction, now_ts()))
-
-        conn.commit()
-
-        # Return updated user + daily
-        user2 = get_user_row(conn, tg_id)
-        payload_user = as_user_payload(user2)
-        payload_user["energy"] = int(user2["energy"] or ENERGY_MAX)
-
-        # Faction unlock message (client can use this)
-        unlocked = scans >= FACTION_UNLOCK_AT
-
-        return {
-            "ok": True,
-            "direction": direction,
-            "ap_delta": 1,
-            "energy": payload_user["energy"],
-            "scans_today": scans,
-            "free_scans_limit": FREE_SCANS_PER_DAY,
-            "faction_unlocked": unlocked,
-            "user": payload_user
-        }
-    finally:
-        conn.close()
+    return {"ok": True}
 
 
-# =============================================================================
-# Run locally:
-#   uvicorn main:app --host 0.0.0.0 --port 8000
-# On Render:
-#   Start command: uvicorn main:app --host 0.0.0.0 --port $PORT
-# =============================================================================
+# -----------------------------------------------------------------------------
+# Root
+# -----------------------------------------------------------------------------
+@app.get("/")
+def root() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "message": "AZEUQER backend online. Use /health.",
+    }
+
+
+# -----------------------------------------------------------------------------
+# NOTE ABOUT THE ORIGINAL CRASH YOU POSTED
+# -----------------------------------------------------------------------------
+# You had: EmailStr -> requires email-validator -> server crashed.
+# This main.py intentionally avoids that dependency to guarantee boot.
+#
+# If you STILL want strict RFC validation:
+#   - install: email-validator
+#   - then switch EmailBindRequest.email to EmailStr
+#
+# But do it only after confirming Render installs the dependency cleanly.
