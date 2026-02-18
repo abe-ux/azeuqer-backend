@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -342,6 +344,29 @@ def assign_founder_flag_if_needed(tg_id: int) -> bool:
 # -----------------------------------------------------------------------------
 
 app = FastAPI(title=APP_NAME, version="24.0")
+
+# ----------------------------
+# Static frontend hosting
+# If you deploy ONLY the backend, the UI is served from the same origin,
+# so the WebApp never needs a separate AZ_API_BASE.
+# ----------------------------
+try:
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+except Exception:
+    # directory may not exist in some runtimes; safe to ignore
+    pass
+
+@app.get("/", include_in_schema=False)
+def serve_index():
+    # Serve the UI (index.html) from ./static/index.html
+    try:
+        return FileResponse("static/index.html")
+    except Exception:
+        return HTMLResponse("<h1>Azeuqer backend is running</h1><p>Missing static/index.html</p>", status_code=200)
+
+@app.get("/health", include_in_schema=False)
+def health_root():
+    return {"ok": True}
 
 app.add_middleware(
     CORSMiddleware,
