@@ -14,3 +14,4 @@ Pillow==10.4.0
 mediapipe==0.10.14
 numpy==1.26.4
 opencv-python==4.8.1.78
+email-validator==2.1.1
