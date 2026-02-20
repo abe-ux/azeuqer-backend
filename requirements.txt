@@ -1,16 +1,18 @@
 fastapi==0.115.0
 uvicorn==0.30.6
-python-dotenv==1.0.1
-python-multipart==0.0.9
+python-dotenv==1.2.1
+httpx==0.27.2
 pydantic==2.12.5
+python-multipart==0.0.9
+PyJWT==2.11.0
+supabase==2.7.4
 email-validator==2.2.0
 
-# Supabase client (pin httpx to a compatible version)
-supabase==2.7.4
-httpx[http2]==0.27.0
-
-# Bio-lock (camera -> face detection)
-mediapipe==0.10.14
+# Face capture / vision (server-side)
 opencv-python-headless==4.8.1.78
 numpy==1.26.4
 Pillow==10.4.0
+
+# Optional (only if you actually use them)
+mediapipe==0.10.14
+sounddevice==0.5.5
